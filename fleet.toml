@@ -1,0 +1,7 @@
+# Sample fleet configuration for the examples.
+# Replace the serial with one from `adb devices` and tag it however you like.
+
+concurrency = 8
+
+[devices]
+"276bcca9" = ["demo"]

@@ -1,0 +1,51 @@
+[project]
+name = "googleadsparser"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "axonctl",
+    "pillow>=12.2.0",
+    "ruff>=0.15.17",
+    "ty>=0.0.49",
+]
+
+[tool.uv.sources]
+axonctl = { git = "https://github.com/magomedov-dev/axonctl.git" }
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "PERF", "PL", "TID",
+]
+ignore = [
+    "E501",    # длину строк контролирует форматтер
+    "PLR0913", # много аргументов — ок для CLI/entrypoints
+    "RUF001", "RUF002", "RUF003",  # неоднозначный unicode — в проекте кириллица
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["googleadsparser"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+[tool.ty.environment]
+python-version = "3.13"
+python = ".venv"
+root = ["."]
+
+[tool.ty.rules]
+unresolved-import = "warn"

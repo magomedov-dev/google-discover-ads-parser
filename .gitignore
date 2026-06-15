@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Editor
+.zed/
+
+# Собранные артефакты рекламы
+ads/
+nodes/
+
+# Отладочные снимки UI (device.inspect)
+ui.html
+bottom_bar.html
+search_bar.html
