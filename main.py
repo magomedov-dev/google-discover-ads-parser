@@ -29,6 +29,7 @@ from axonctl import (
     Selector,
     UiNode,
     UiTree,
+    WaitTimeout,
     retry_on_stale,
 )
 from PIL import Image
@@ -122,6 +123,8 @@ class GoogleParser:
     ALIGN_TOLERANCE: int = 20
     #: Ожидание появления элементов (медленный старт / плохой интернет), с.
     READY_TIMEOUT: float = 15.0
+    #: Сколько ждём загрузки сайта рекламы; дольше — закрываем и листаем дальше, с.
+    AD_LOAD_TIMEOUT: float = 3.0
     #: Базовая пауза «дать UI/ленте успокоиться», с.
     SETTLE: float = 0.5
     #: Сколько максимум ждать, пока лента догрузится и перестанет двигаться, с.
@@ -541,14 +544,61 @@ class GoogleParser:
         y = max(ws.top, min(target.center.y, ws.bottom))
         await self.device.tap(target.center.x, y)
 
-        # Дожидаемся открытия Chrome, затем окончания загрузки страницы.
+        # Дожидаемся открытия Chrome, затем окончания загрузки страницы. Если сайт
+        # рекламы грузится дольше AD_LOAD_TIMEOUT — не ждём, закрываем и листаем дальше.
         await self.device.wait_for(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
-        await self.device.wait_gone(GoogleSelectors.CHROME_PROGRESS_BAR, timeout=self.READY_TIMEOUT)
+        try:
+            await self.device.wait_gone(
+                GoogleSelectors.CHROME_PROGRESS_BAR, timeout=self.AD_LOAD_TIMEOUT
+            )
+        except WaitTimeout:
+            logger.info(
+                "[%s] сайт рекламы грузится дольше %.0fс — закрываю",
+                self.device.serial,
+                self.AD_LOAD_TIMEOUT,
+            )
 
-        # Возвращаемся в ленту Google.
+        # Возвращаемся в ленту Google (закрываем сайт рекламы).
         await self.device.global_action("back")
         await self.device.wait_for(GoogleSelectors.FEED, timeout=self.READY_TIMEOUT)
         logger.info("[%s] реклама открыта и закрыта (back), осталась в ленте", self.device.serial)
+
+    async def _wait_refresh_done(self, region_bottom: int) -> None:
+        """Дождаться появления и исчезновения индикатора обновления ленты.
+
+        Pull-to-refresh показывает элемент с ``content-desc`` «Google» в полосе над
+        строкой поиска (y от 0 до ``region_bottom``): его появление означает, что
+        обновление пошло, исчезновение — что завершилось. Ищем строго в этой полосе,
+        чтобы не спутать с другими элементами «Google» на экране. Best-effort.
+
+        Args:
+            region_bottom: Нижняя граница полосы поиска индикатора (``search.bounds.top``).
+        """
+
+        async def present() -> bool:
+            tree = await self.device.dump()
+            return any(
+                node.bounds is not None
+                and node.bounds.top >= 0
+                and node.bounds.bottom <= region_bottom
+                for node in tree.find_all(Selector.desc("Google"))
+            )
+
+        poll = 0.2
+        # Появление индикатора (обновление началось).
+        for _ in range(int(self.READY_TIMEOUT / poll)):
+            if await present():
+                break
+            await asyncio.sleep(poll)
+        # Исчезновение индикатора (обновление завершилось).
+        for _ in range(int(self.READY_TIMEOUT / poll)):
+            if not await present():
+                logger.info("[%s] обновление ленты завершилось", self.device.serial)
+                return
+            await asyncio.sleep(poll)
+        logger.warning(
+            "[%s] индикатор обновления не исчез за %.0fс", self.device.serial, self.READY_TIMEOUT
+        )
 
     async def update_feed(self) -> None:
         """Обновить ленту перед закрытием: прокрутить наверх и сделать pull-to-refresh.
@@ -581,11 +631,17 @@ class GoogleParser:
             await self.device.tap(home.center.x, home.center.y)
             await self.device.tap(home.center.x, home.center.y)
             # Дождаться, что лента перерисовалась (вернулась строка поиска).
-            await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
+            search = await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
             await self.wait_feed_settled()
 
             # Pull-to-refresh: быстрый свайп сверху вниз в рабочей области.
             await self.device.swipe(cx, y_top, cx, y_bottom, duration=100)
+
+            # Дождаться, пока индикатор обновления (desc «Google» над строкой поиска)
+            # появится и исчезнет — значит лента реально обновилась.
+            if search.bounds is not None:
+                await self._wait_refresh_done(search.bounds.top)
+
             await asyncio.sleep(self.SETTLE)
             logger.info("[%s] лента обновлена перед закрытием", self.device.serial)
         except AxonError as exc:
@@ -611,7 +667,7 @@ class GoogleParser:
 
         await self.swipe_forward()  # пропускаем рекламу, чтобы не найти её снова
 
-    async def parse_feed(self, swipes: int = 15) -> None:
+    async def parse_feed(self, swipes: int = 25) -> None:
         """Листать ленту, собирая рекламу.
 
         Каждая итерация изолирована: транзиентный сбой (таймаут загрузки, обрыв
