@@ -127,6 +127,10 @@ class GoogleParser:
     AD_LOAD_TIMEOUT: float = 3.0
     #: Сколько раз жмём back, возвращаясь из рекламы в ленту, прежде чем сдаться.
     BACK_ATTEMPTS: int = 5
+    #: Маркеры видео-рекламы в ``resource_id`` (видео — WebView внутри video_frame).
+    VIDEO_ID_MARKERS: tuple[str, ...] = ("video_frame", "duration_badge", "webx_web_view")
+    #: Классы видео-плеера в карточке.
+    VIDEO_CLASSES: tuple[str, ...] = ("VideoView", "SurfaceView", "TextureView")
     #: Базовая пауза «дать UI/ленте успокоиться», с.
     SETTLE: float = 0.5
     #: Сколько максимум ждать, пока лента догрузится и перестанет двигаться, с.
@@ -505,6 +509,43 @@ class GoogleParser:
         # Кликаем по рекламе (откроется Chrome и вернёмся), чтобы она не пропала из ленты.
         await self.click_ad(sponsored)
 
+    def _video_node(self, card: UiNode) -> UiNode | None:
+        """Найти узел видео в карточке (видео-плеер или video_frame).
+
+        Args:
+            card: Узел рекламной карточки.
+
+        Returns:
+            Узел видео, пригодный для тапа, либо ``None`` если рекламы-видео нет.
+        """
+        for node in card.descendants():
+            if node.center is None:
+                continue
+            rid = node.resource_id or ""
+            cls = node.class_name or ""
+            desc = node.content_desc or ""
+            if (
+                any(m in rid for m in self.VIDEO_ID_MARKERS)
+                or any(v in cls for v in self.VIDEO_CLASSES)
+                or desc.startswith("Video ")
+            ):
+                return node
+        return None
+
+    def _ad_tap_node(self, card: UiNode) -> UiNode | None:
+        """Выбрать узел, по которому открывать рекламу.
+
+        Видео-реклама открывается тапом по самому видео; картинка/карусель — тапом
+        по тексту (заголовку).
+
+        Args:
+            card: Узел рекламной карточки.
+
+        Returns:
+            Узел для тапа, либо ``None`` если подходящего нет.
+        """
+        return self._video_node(card) or self._ad_text_node(card)
+
     def _ad_text_node(self, card: UiNode) -> UiNode | None:
         """Найти текстовый узел рекламы для тапа — заголовок (самый длинный текст).
 
@@ -526,22 +567,23 @@ class GoogleParser:
         return best
 
     async def click_ad(self, sponsored: UiNode) -> None:
-        """Тапнуть по тексту рекламы, дождаться загрузки Chrome и вернуться назад.
+        """Открыть рекламу тапом, дождаться загрузки Chrome и вернуться назад.
 
-        Клик открывает Chrome с лендингом; ждём появления Chrome, затем окончания
-        загрузки (исчезновения :attr:`GoogleSelectors.CHROME_PROGRESS_BAR`) и жмём
-        back. Такое «взаимодействие» регистрируется, благодаря чему реклама не
-        пропадает из ленты.
+        Цель тапа зависит от формы: видео открываем тапом по видео, картинку и
+        карусель — тапом по тексту (заголовку). Клик открывает Chrome с лендингом;
+        ждём появления Chrome, затем окончания загрузки (исчезновения
+        :attr:`GoogleSelectors.CHROME_PROGRESS_BAR`) и жмём back. Такое
+        «взаимодействие» регистрируется, благодаря чему реклама не пропадает из ленты.
 
         Args:
             sponsored: Узел рекламной карточки (с актуальными границами).
         """
-        target = self._ad_text_node(sponsored)
+        target = self._ad_tap_node(sponsored)
         if target is None or target.center is None:
-            logger.warning("[%s] не нашёл текст рекламы для тапа", self.device.serial)
+            logger.warning("[%s] не нашёл, по чему тапнуть в рекламе", self.device.serial)
             return
 
-        # Тап по тексту, но не выше рабочей области (если карточка выходит за кадр).
+        # Тап по цели, но не выше рабочей области (если карточка выходит за кадр).
         ws = self.working_bounds
         y = max(ws.top, min(target.center.y, ws.bottom))
         await self.device.tap(target.center.x, y)
