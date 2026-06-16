@@ -125,6 +125,8 @@ class GoogleParser:
     READY_TIMEOUT: float = 15.0
     #: Сколько ждём загрузки сайта рекламы; дольше — закрываем и листаем дальше, с.
     AD_LOAD_TIMEOUT: float = 3.0
+    #: Сколько раз жмём back, возвращаясь из рекламы в ленту, прежде чем сдаться.
+    BACK_ATTEMPTS: int = 5
     #: Базовая пауза «дать UI/ленте успокоиться», с.
     SETTLE: float = 0.5
     #: Сколько максимум ждать, пока лента догрузится и перестанет двигаться, с.
@@ -558,10 +560,17 @@ class GoogleParser:
                 self.AD_LOAD_TIMEOUT,
             )
 
-        # Возвращаемся в ленту Google (закрываем сайт рекламы).
-        await self.device.global_action("back")
-        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.READY_TIMEOUT)
-        logger.info("[%s] реклама открыта и закрыта (back), осталась в ленте", self.device.serial)
+        # Возвращаемся в ленту: жмём back, пока не увидим ленту — одного раза может не
+        # хватить (реклама могла открыть несколько страниц/редиректов).
+        for _ in range(self.BACK_ATTEMPTS):
+            await self.device.global_action("back")
+            await asyncio.sleep(self.SETTLE)
+            if await self.device.find(GoogleSelectors.FEED) is not None:
+                logger.info("[%s] вернулись в ленту, реклама осталась", self.device.serial)
+                return
+        logger.warning(
+            "[%s] не удалось вернуться в ленту за %d back", self.device.serial, self.BACK_ATTEMPTS
+        )
 
     async def _wait_refresh_done(self, region_bottom: int) -> None:
         """Дождаться появления и исчезновения индикатора обновления ленты.
