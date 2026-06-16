@@ -18,6 +18,7 @@
 import asyncio
 import json
 import logging
+import random
 from io import BytesIO
 from pathlib import Path
 
@@ -125,6 +126,9 @@ class GoogleParser:
     READY_TIMEOUT: float = 15.0
     #: Сколько ждём загрузки сайта рекламы; дольше — закрываем и листаем дальше, с.
     AD_LOAD_TIMEOUT: float = 3.0
+    #: Сколько «смотрим» сайт рекламы после загрузки перед закрытием (случайно), с.
+    AD_DWELL_MIN: float = 2.0
+    AD_DWELL_MAX: float = 5.0
     #: Сколько раз жмём back, возвращаясь из рекламы в ленту, прежде чем сдаться.
     BACK_ATTEMPTS: int = 5
     #: Маркеры видео-рекламы в ``resource_id`` (видео — WebView внутри video_frame).
@@ -601,6 +605,11 @@ class GoogleParser:
                 self.device.serial,
                 self.AD_LOAD_TIMEOUT,
             )
+
+        # «Смотрим» сайт рекламы — пауза перед закрытием, чтобы не закрывать моментально.
+        dwell = random.uniform(self.AD_DWELL_MIN, self.AD_DWELL_MAX)
+        logger.info("[%s] смотрю сайт рекламы %.1fс", self.device.serial, dwell)
+        await asyncio.sleep(dwell)
 
         # Возвращаемся в ленту: жмём back, пока не увидим ленту — одного раза может не
         # хватить (реклама могла открыть несколько страниц/редиректов).
