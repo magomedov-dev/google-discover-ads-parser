@@ -5,9 +5,10 @@
 1. Запустить приложение Google и дождаться его на переднем плане.
 2. Определить рабочую область ленты (между строкой поиска и низом ленты).
 3. Листать ленту медленными свайпами, выискивая карточки с пометкой «Sponsored».
-4. Найдя рекламу — подвести её низ к низу рабочей области, снять скрин и сохранить
-   (скрин + структуру) в отдельный каталог ``adNNN`` со сквозной нумерацией, затем
-   кликнуть по ней (открыть Chrome и вернуться back), чтобы она не пропала из ленты.
+4. Найдя рекламу — подвести её низ к низу рабочей области и обработать: общий скрин,
+   скрин медиа, текст и канал, затем открыть (видео — тапом по видео, картинка/карусель
+   — по тексту; Google Play пропускаем) и собрать ссылки (сайт, для видео — и видео).
+   Всё кладётся в ``adNNN`` со сквозной нумерацией; дубли пропускаются.
 5. Терпеть транзиентные сбои (медленный интернет, обрыв связи, устаревшее дерево):
    ожидания адаптивны, ошибки изолированы по итерациям, запуск — с повторами.
 
@@ -18,6 +19,9 @@
 import asyncio
 import json
 import logging
+import random
+import re
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
@@ -29,6 +33,7 @@ from axonctl import (
     Selector,
     UiNode,
     UiTree,
+    WaitTimeout,
     retry_on_stale,
 )
 from PIL import Image
@@ -53,8 +58,19 @@ class GoogleSelectors:
     )
     TOP_BAR = Selector.id("top_bar_compose_root")
     SEARCH = Selector.id("googleapp_facade_search_box")
+    SPONSORED = Selector.text("Sponsored")
     CHROME_TOOL_BAR = Selector.id("com.android.chrome:id/toolbar")
     CHROME_PROGRESS_BAR = Selector.id("com.android.chrome:id/toolbar_progress_bar")
+    #: Кнопка закрытия (крестик) в Chrome Custom Tab / плеере.
+    CHROME_CLOSE = Selector.id("com.android.chrome:id/close_button")
+    #: «Share link» в тулбаре Chrome — открывает диалог шеринга ссылки.
+    SHARE_LINK = Selector.desc("Share link")
+    #: Текст превью в системном диалоге шеринга — содержит ссылку на сайт рекламы.
+    SHARE_PREVIEW_TEXT = Selector.id("android:id/content_preview_text")
+    #: Контейнер видео-плеера (внутри WebView рекламы-видео).
+    PLAYER_CONTAINER = Selector.id("playerContainer")
+    #: Поле со ссылкой на видео в диалоге «Поделиться» плеера.
+    VIDEO_SHARE_URL = Selector.id("unified-share-url-input:0")
 
 
 def save_node(node: UiNode, path: Path) -> None:
@@ -102,6 +118,27 @@ def save_node(node: UiNode, path: Path) -> None:
     logger.info("структура узла сохранена в %s", path)
 
 
+@dataclass(frozen=True, slots=True)
+class AdInfo:
+    """Разобранные из карточки данные рекламы и геометрия для скринов.
+
+    Attributes:
+        form: Форма — ``"video"`` / ``"carousel"`` / ``"image"``.
+        text: Заголовок рекламы (самый длинный текст карточки).
+        channel: Название канала/рекламодателя.
+        is_google_play: Ведёт ли реклама на Google Play (такие не открываем).
+        card_box: Прямоугольник общего скрина карточки (прижат к рабочей области).
+        media_box: Прямоугольник медиа (картинка/видео/карусель) или ``None``.
+    """
+
+    form: str
+    text: str | None
+    channel: str | None
+    is_google_play: bool
+    card_box: tuple[int, int, int, int] | None
+    media_box: tuple[int, int, int, int] | None
+
+
 class GoogleParser:
     """Скрейпер рекламы из ленты Google Discover на одном устройстве.
 
@@ -122,6 +159,23 @@ class GoogleParser:
     ALIGN_TOLERANCE: int = 20
     #: Ожидание появления элементов (медленный старт / плохой интернет), с.
     READY_TIMEOUT: float = 15.0
+    #: Сколько ждём загрузки сайта рекламы; дольше — закрываем и листаем дальше, с.
+    AD_LOAD_TIMEOUT: float = 3.0
+    #: Сколько «смотрим» сайт рекламы после загрузки перед закрытием (случайно), с.
+    AD_DWELL_MIN: float = 2.0
+    AD_DWELL_MAX: float = 5.0
+    #: Сколько раз жмём back, возвращаясь из рекламы в ленту, прежде чем сдаться.
+    BACK_ATTEMPTS: int = 5
+    #: Сколько свайпов делать после рекламы (в т.ч. пропущенной), чтобы не найти её снова.
+    POST_AD_SWIPES: int = 2
+    #: Маркеры видео-рекламы в ``resource_id`` (видео — WebView внутри video_frame).
+    VIDEO_ID_MARKERS: tuple[str, ...] = ("video_frame", "duration_badge", "webx_web_view")
+    #: Классы видео-плеера в карточке.
+    VIDEO_CLASSES: tuple[str, ...] = ("VideoView", "SurfaceView", "TextureView")
+    #: Классы контейнера карусели (несколько креативов в одном объявлении).
+    CAROUSEL_CLASSES: tuple[str, ...] = ("RecyclerView", "ViewPager")
+    #: Минимальная высота медиа-области (px), иначе считаем, что её нет.
+    MIN_MEDIA_HEIGHT: int = 80
     #: Базовая пауза «дать UI/ленте успокоиться», с.
     SETTLE: float = 0.5
     #: Сколько максимум ждать, пока лента догрузится и перестанет двигаться, с.
@@ -150,6 +204,8 @@ class GoogleParser:
         self._out_dir = self.OUTPUT_DIR / device.serial
         #: Счётчик сохранённых реклам — продолжается с последней на диске (переживает перезапуск).
         self._ad_count: int = self._last_ad_index()
+        #: Уже обработанные рекламы (канал + заголовок) — чтобы не собирать дубли.
+        self._seen: set[tuple[str | None, str | None]] = set()
 
     def _last_ad_index(self) -> int:
         """Найти наибольший уже сохранённый номер рекламы, чтобы продолжить нумерацию.
@@ -460,51 +516,32 @@ class GoogleParser:
         raw = await self.device.screenshot(format="png")
         return Image.open(BytesIO(raw))
 
-    async def parse_sponsored(self, sponsored: UiNode) -> None:
-        """Снять скрин рекламы, обрезать по её границам и сохранить.
+    # --------------------------------------------------------------------- #
+    # Разбор рекламной карточки
+    # --------------------------------------------------------------------- #
 
-        Каждая реклама кладётся в собственный каталог ``adNNN`` (нумерация сквозная
-        и продолжается после перезапуска скрипта — см. :meth:`_last_ad_index`):
+    def _video_node(self, card: UiNode) -> UiNode | None:
+        """Найти узел видео в карточке (видео-плеер или video_frame).
 
-        * ``screenshot.png`` — обрезанный по карточке скрин;
-        * ``structure.json`` — UI-структура карточки.
-
-        Кроп прижимается к рабочей области по вертикали, чтобы в кадр не попали
-        строка поиска сверху и навигация снизу.
-
-        Args:
-            sponsored: Узел рекламной карточки (с актуальными границами).
+        Returns:
+            Узел видео, пригодный для тапа, либо ``None`` если рекламы-видео нет.
         """
-        if sponsored.bounds is None:
-            return
-
-        ws = self.working_bounds
-        box = (
-            sponsored.bounds.left,
-            max(sponsored.bounds.top, ws.top),  # не залезаем выше рабочей области
-            sponsored.bounds.right,
-            min(sponsored.bounds.bottom, ws.bottom),
-        )
-
-        # Свой каталог на рекламу; номер продолжает уже сохранённые на диске.
-        self._ad_count += 1
-        ad_dir = self._out_dir / f"ad{self._ad_count:03d}"
-        ad_dir.mkdir(parents=True, exist_ok=True)
-
-        image = await self.take_screenshot()
-        image.crop(box).save(ad_dir / "screenshot.png")
-        save_node(sponsored, ad_dir / "structure.json")
-        await self.device.inspect(ad_dir / "ui.html")  # интерактивный HTML-снимок экрана
-        logger.info("[%s] реклама сохранена в %s", self.device.serial, ad_dir)
-
-        # Кликаем по рекламе (откроется Chrome и вернёмся), чтобы она не пропала из ленты.
-        await self.click_ad(sponsored)
+        for node in card.descendants():
+            if node.center is None:
+                continue
+            rid = node.resource_id or ""
+            cls = node.class_name or ""
+            desc = node.content_desc or ""
+            if (
+                any(m in rid for m in self.VIDEO_ID_MARKERS)
+                or any(v in cls for v in self.VIDEO_CLASSES)
+                or desc.startswith("Video ")
+            ):
+                return node
+        return None
 
     def _ad_text_node(self, card: UiNode) -> UiNode | None:
         """Найти текстовый узел рекламы для тапа — заголовок (самый длинный текст).
-
-        Args:
-            card: Узел рекламной карточки.
 
         Returns:
             Узел с самым длинным текстом (кроме «Sponsored»), пригодный для тапа,
@@ -520,35 +557,367 @@ class GoogleParser:
                 best, best_len = node, len(text)
         return best
 
-    async def click_ad(self, sponsored: UiNode) -> None:
-        """Тапнуть по тексту рекламы, дождаться загрузки Chrome и вернуться назад.
+    def _footer_node(self, card: UiNode) -> UiNode | None:
+        """Футер карточки — узел, среди прямых детей которого есть «Sponsored»."""
+        for node in card.descendants():
+            for child in node.children:
+                if (child.text or "").strip() == "Sponsored":
+                    return node
+        return None
 
-        Клик открывает Chrome с лендингом; ждём появления Chrome, затем окончания
-        загрузки (исчезновения :attr:`GoogleSelectors.CHROME_PROGRESS_BAR`) и жмём
-        back. Такое «взаимодействие» регистрируется, благодаря чему реклама не
-        пропадает из ленты.
+    def detect_form(self, card: UiNode) -> str:
+        """Определить форму рекламы: ``video`` / ``carousel`` / ``image``."""
+        for node in card.descendants():
+            rid = node.resource_id or ""
+            cls = node.class_name or ""
+            desc = node.content_desc or ""
+            if (
+                any(m in rid for m in self.VIDEO_ID_MARKERS)
+                or any(v in cls for v in self.VIDEO_CLASSES)
+                or desc.startswith("Video ")
+            ):
+                return "video"
+        for node in card.descendants():
+            if any(c in (node.class_name or "") for c in self.CAROUSEL_CLASSES):
+                return "carousel"
+        return "image"
+
+    def _is_google_play(self, card: UiNode) -> bool:
+        """Ведёт ли реклама на Google Play (по тексту канала/CTA) — такие пропускаем."""
+        for node in card.descendants():
+            blob = f"{node.text or ''} {node.content_desc or ''}"
+            if "Google Play" in blob or "Install app" in blob:
+                return True
+        return False
+
+    def parse_ad(self, card: UiNode) -> AdInfo:
+        """Разобрать карточку: форма, заголовок, канал, медиа-область, признак Google Play.
+
+        * Канал — текстовый сосед «Sponsored» в футере.
+        * Заголовок — самый длинный текст вне футера.
+        * Медиа-область — от верха карточки до верха заголовка (или до футера).
+        """
+        form = self.detect_form(card)
+        is_gp = self._is_google_play(card)
+
+        footer = self._footer_node(card)
+        footer_ids: set[int] = set()
+        if footer is not None:
+            footer_ids = {id(footer)} | {id(n) for n in footer.descendants()}
+
+        channel: str | None = None
+        if footer is not None:
+            for child in footer.children:
+                text = (child.text or "").strip()
+                if text and text != "Sponsored" and not (child.class_name or "").endswith("Button"):
+                    channel = text
+                    break
+
+        headline: UiNode | None = None
+        best_len = -1
+        for node in card.descendants():
+            if id(node) in footer_ids:
+                continue
+            text = (node.text or "").strip()
+            if not text or text in ("Sponsored", channel):
+                continue
+            if len(text) > best_len:
+                headline, best_len = node, len(text)
+        text = headline.text.strip() if headline is not None and headline.text else None
+
+        card_box, media_box = self._ad_boxes(card, headline, footer)
+
+        return AdInfo(form, text, channel, is_gp, card_box, media_box)
+
+    def _ad_boxes(
+        self, card: UiNode, headline: UiNode | None, footer: UiNode | None
+    ) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+        """Посчитать прямоугольники общего скрина и медиа (прижатые к рабочей области).
+
+        Returns:
+            Кортеж ``(card_box, media_box)``; любой элемент ``None``, если его нет.
+        """
+        if card.bounds is None:
+            return None, None
+        ws = self.working_bounds
+        top = max(card.bounds.top, ws.top)
+        bottom = min(card.bounds.bottom, ws.bottom)
+        card_box = (card.bounds.left, top, card.bounds.right, bottom)
+
+        if headline is not None and headline.bounds is not None:
+            media_bottom = headline.bounds.top
+        elif footer is not None and footer.bounds is not None:
+            media_bottom = footer.bounds.top
+        else:
+            media_bottom = bottom
+        media_bottom = min(media_bottom, ws.bottom)
+
+        media_box = None
+        if media_bottom - top >= self.MIN_MEDIA_HEIGHT:
+            media_box = (card.bounds.left, top, card.bounds.right, media_bottom)
+        return card_box, media_box
+
+    # --------------------------------------------------------------------- #
+    # Обработка рекламы: скрины, текст/канал, открытие и ссылки
+    # --------------------------------------------------------------------- #
+
+    async def process_ad(self, card: UiNode) -> None:
+        """Обработать найденную рекламу: скрины, текст/канал, открытие и ссылки.
+
+        Шаги: общий скрин → скрин медиа → текст и канал → открытие рекламы и сбор
+        ссылок (для видео — сайт + видео, для картинки/карусели — только сайт;
+        Google Play не открываем). Дубли (тот же канал+заголовок) пропускаются.
 
         Args:
-            sponsored: Узел рекламной карточки (с актуальными границами).
+            card: Узел рекламной карточки (с актуальными границами).
         """
-        target = self._ad_text_node(sponsored)
-        if target is None or target.center is None:
-            logger.warning("[%s] не нашёл текст рекламы для тапа", self.device.serial)
+        if card.bounds is None:
             return
+        info = self.parse_ad(card)
 
-        # Тап по тексту, но не выше рабочей области (если карточка выходит за кадр).
+        key = (info.channel, info.text)
+        if key in self._seen:
+            logger.info(
+                "[%s] реклама уже собрана (%s) — пропускаю", self.device.serial, info.channel
+            )
+            return
+        self._seen.add(key)
+
+        # Свой каталог на рекламу; номер продолжает уже сохранённые на диске.
+        self._ad_count += 1
+        ad_dir = self._out_dir / f"ad{self._ad_count:03d}"
+        ad_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1-2. Общий скрин карточки и скрин медиа (картинка/видео/карусель).
+        image = await self.take_screenshot()
+        if info.card_box is not None:
+            image.crop(info.card_box).save(ad_dir / "general.png")
+        if info.media_box is not None:
+            image.crop(info.media_box).save(ad_dir / "media.png")
+
+        # 3-4. Текст и канал (+ структура и HTML для отладки) — пишем в meta.json ниже.
+        save_node(card, ad_dir / "structure.json")
+        await self.device.inspect(ad_dir / "ui.html")
+        logger.info(
+            "[%s] реклама [%s] канал=%r -> %s", self.device.serial, info.form, info.channel, ad_dir
+        )
+
+        # 5. Открытие рекламы и сбор ссылок (Google Play — пропускаем открытие).
+        landing_url: str | None = None
+        video_url: str | None = None
+        if info.is_google_play:
+            logger.info("[%s] реклама ведёт на Google Play — не открываю", self.device.serial)
+        elif await self._open_ad(info, card):
+            try:
+                await self._wait_ad_loaded()
+                landing_url = await self._grab_landing_url()
+                if info.form == "video":
+                    video_url = await self._grab_video_url()
+            except AxonError as exc:
+                logger.warning("[%s] сбой при сборе ссылок: %s", self.device.serial, exc)
+            finally:
+                await self._back_to_feed()
+
+        (ad_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "form": info.form,
+                    "text": info.text,
+                    "channel": info.channel,
+                    "google_play": info.is_google_play,
+                    "landing_url": landing_url,
+                    "video_url": video_url,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    async def _open_ad(self, info: AdInfo, card: UiNode) -> bool:
+        """Тапнуть, чтобы открыть рекламу: видео — по видео, иначе — по тексту.
+
+        Returns:
+            ``True`` если тап выполнен, ``False`` если не нашли по чему тапнуть.
+        """
+        target = self._video_node(card) if info.form == "video" else self._ad_text_node(card)
+        if target is None or target.center is None:
+            logger.warning("[%s] не нашёл, по чему тапнуть [%s]", self.device.serial, info.form)
+            return False
+        # Тап по цели, но не выше рабочей области (если карточка выходит за кадр).
         ws = self.working_bounds
         y = max(ws.top, min(target.center.y, ws.bottom))
         await self.device.tap(target.center.x, y)
+        logger.info("[%s] открываю рекламу [%s]", self.device.serial, info.form)
+        return True
 
-        # Дожидаемся открытия Chrome, затем окончания загрузки страницы.
+    async def _wait_ad_loaded(self) -> None:
+        """Дождаться Chrome и загрузки сайта рекламы (с ограничением), затем «посмотреть»."""
         await self.device.wait_for(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
-        await self.device.wait_gone(GoogleSelectors.CHROME_PROGRESS_BAR, timeout=self.READY_TIMEOUT)
+        try:
+            await self.device.wait_gone(
+                GoogleSelectors.CHROME_PROGRESS_BAR, timeout=self.AD_LOAD_TIMEOUT
+            )
+        except WaitTimeout:
+            logger.info(
+                "[%s] сайт рекламы грузится дольше %.0fс", self.device.serial, self.AD_LOAD_TIMEOUT
+            )
+        dwell = random.uniform(self.AD_DWELL_MIN, self.AD_DWELL_MAX)
+        logger.info("[%s] смотрю сайт рекламы %.1fс", self.device.serial, dwell)
+        await asyncio.sleep(dwell)
 
-        # Возвращаемся в ленту Google.
-        await self.device.global_action("back")
-        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.READY_TIMEOUT)
-        logger.info("[%s] реклама открыта и закрыта (back), осталась в ленте", self.device.serial)
+    @staticmethod
+    def _extract_url(text: str) -> str | None:
+        """Вытащить первую http(s)-ссылку из текста."""
+        match = re.search(r"https?://\S+", text)
+        return match.group(0) if match else None
+
+    async def _grab_landing_url(self) -> str | None:
+        """Снять ссылку на сайт рекламы через кнопку «Share link» в тулбаре Chrome.
+
+        Дожидаемся тулбара, тапаем именно кнопку «Share link» (а не центр тулбара,
+        где сама ссылка), читаем превью-текст со ссылкой и возвращаемся к Chrome.
+        Best-effort: при сбое возвращаем ``None``.
+        """
+        try:
+            await self.device.wait_for(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
+
+            # Кнопка «Share link» в тулбаре — тапаем её, а не центр тулбара (ссылку).
+            share = await self.device.wait_for(
+                GoogleSelectors.SHARE_LINK, timeout=self.READY_TIMEOUT
+            )
+            if share.center is not None:
+                await self.device.tap(share.center.x, share.center.y)
+
+            preview = await self.device.wait_for(
+                GoogleSelectors.SHARE_PREVIEW_TEXT, timeout=self.READY_TIMEOUT
+            )
+            url = self._extract_url(preview.text or "")
+            logger.info("[%s] ссылка на сайт: %s", self.device.serial, url)
+
+            # Закрываем диалог шеринга — back, пока снова не окажемся в Chrome.
+            await self._back_until(GoogleSelectors.CHROME_TOOL_BAR)
+            return url
+        except AxonError as exc:
+            logger.warning("[%s] не удалось получить ссылку на сайт: %s", self.device.serial, exc)
+            return None
+
+    async def _grab_video_url(self) -> str | None:
+        """Снять ссылку на видео через диалог «Поделиться» плеера.
+
+        Закрываем сайт (close_button), в плеере под полосой прокрутки слева тапаем
+        кнопку «Поделиться» и читаем поле со ссылкой. Best-effort.
+        """
+        try:
+            close = await self.device.wait_for(
+                GoogleSelectors.CHROME_CLOSE, timeout=self.READY_TIMEOUT
+            )
+            if close.center is not None:
+                await self.device.tap(close.center.x, close.center.y)
+
+            tree = await self.device.dump()
+            player = tree.find(GoogleSelectors.PLAYER_CONTAINER)
+            if player is None:
+                logger.warning("[%s] плеер не найден — нет ссылки на видео", self.device.serial)
+                return None
+
+            seek = next(
+                (
+                    n
+                    for n in player.descendants()
+                    if (n.class_name or "").endswith("SeekBar") and n.bounds
+                ),
+                None,
+            )
+            if seek is None or seek.bounds is None:
+                logger.warning("[%s] полоса прокрутки плеера не найдена", self.device.serial)
+                return None
+
+            # Кнопка «Поделиться» — кликабельный узел под полосой, в левой части.
+            share = min(
+                (
+                    n
+                    for n in player.descendants()
+                    if n.clickable
+                    and n.center is not None
+                    and n.bounds is not None
+                    and n.bounds.top >= seek.bounds.bottom
+                ),
+                key=lambda n: n.center.x,  # type: ignore[union-attr]
+                default=None,
+            )
+            if share is None or share.center is None:
+                logger.warning("[%s] кнопка «Поделиться» видео не найдена", self.device.serial)
+                return None
+
+            await self.device.tap(share.center.x, share.center.y)
+            field = await self.device.wait_for(
+                GoogleSelectors.VIDEO_SHARE_URL, timeout=self.READY_TIMEOUT
+            )
+            url = (field.text or "").strip() or None
+            logger.info("[%s] ссылка на видео: %s", self.device.serial, url)
+            return url
+        except AxonError as exc:
+            logger.warning("[%s] не удалось получить ссылку на видео: %s", self.device.serial, exc)
+            return None
+
+    async def _back_until(self, selector: Selector, attempts: int | None = None) -> bool:
+        """Жать back, пока на экране не появится ``selector`` (или не кончатся попытки)."""
+        attempts = attempts or self.BACK_ATTEMPTS
+        for _ in range(attempts):
+            if await self.device.find(selector) is not None:
+                return True
+            await self.device.global_action("back")
+            await asyncio.sleep(self.SETTLE)
+        return await self.device.find(selector) is not None
+
+    async def _back_to_feed(self) -> None:
+        """Вернуться в ленту: жать back, пока не появится FEED."""
+        if await self._back_until(GoogleSelectors.FEED):
+            logger.info("[%s] вернулись в ленту, реклама осталась", self.device.serial)
+        else:
+            logger.warning(
+                "[%s] не удалось вернуться в ленту за %d back",
+                self.device.serial,
+                self.BACK_ATTEMPTS,
+            )
+
+    async def _wait_refresh_done(self, region_bottom: int) -> None:
+        """Дождаться появления и исчезновения индикатора обновления ленты.
+
+        Pull-to-refresh показывает элемент с ``content-desc`` «Google» в полосе над
+        строкой поиска (y от 0 до ``region_bottom``): его появление означает, что
+        обновление пошло, исчезновение — что завершилось. Ищем строго в этой полосе,
+        чтобы не спутать с другими элементами «Google» на экране. Best-effort.
+
+        Args:
+            region_bottom: Нижняя граница полосы поиска индикатора (``search.bounds.top``).
+        """
+
+        async def present() -> bool:
+            tree = await self.device.dump()
+            return any(
+                node.bounds is not None
+                and node.bounds.top >= 0
+                and node.bounds.bottom <= region_bottom
+                for node in tree.find_all(Selector.desc("Google"))
+            )
+
+        poll = 0.2
+        # Появление индикатора (обновление началось).
+        for _ in range(int(self.READY_TIMEOUT / poll)):
+            if await present():
+                break
+            await asyncio.sleep(poll)
+        # Исчезновение индикатора (обновление завершилось).
+        for _ in range(int(self.READY_TIMEOUT / poll)):
+            if not await present():
+                logger.info("[%s] обновление ленты завершилось", self.device.serial)
+                return
+            await asyncio.sleep(poll)
+        logger.warning(
+            "[%s] индикатор обновления не исчез за %.0fс", self.device.serial, self.READY_TIMEOUT
+        )
 
     async def update_feed(self) -> None:
         """Обновить ленту перед закрытием: прокрутить наверх и сделать pull-to-refresh.
@@ -581,11 +950,17 @@ class GoogleParser:
             await self.device.tap(home.center.x, home.center.y)
             await self.device.tap(home.center.x, home.center.y)
             # Дождаться, что лента перерисовалась (вернулась строка поиска).
-            await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
+            search = await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
             await self.wait_feed_settled()
 
             # Pull-to-refresh: быстрый свайп сверху вниз в рабочей области.
             await self.device.swipe(cx, y_top, cx, y_bottom, duration=100)
+
+            # Дождаться, пока индикатор обновления (desc «Google» над строкой поиска)
+            # появится и исчезнет — значит лента реально обновилась.
+            if search.bounds is not None:
+                await self._wait_refresh_done(search.bounds.top)
+
             await asyncio.sleep(self.SETTLE)
             logger.info("[%s] лента обновлена перед закрытием", self.device.serial)
         except AxonError as exc:
@@ -607,11 +982,14 @@ class GoogleParser:
         self._root = await self.wait_feed_settled()
         sponsored = await self.get_sponsored_block()
         if sponsored is not None:
-            await self.parse_sponsored(sponsored)
+            await self.process_ad(sponsored)
 
-        await self.swipe_forward()  # пропускаем рекламу, чтобы не найти её снова
+        # Несколько свайпов, чтобы уехать от рекламы (в т.ч. пропущенной Google Play)
+        # и не найти её снова.
+        for _ in range(self.POST_AD_SWIPES):
+            await self.swipe_forward()
 
-    async def parse_feed(self, swipes: int = 15) -> None:
+    async def parse_feed(self, swipes: int = 25) -> None:
         """Листать ленту, собирая рекламу.
 
         Каждая итерация изолирована: транзиентный сбой (таймаут загрузки, обрыв
@@ -740,4 +1118,5 @@ async def main() -> None:
             logger.error("[%s] прогон упал: %s", serial, outcome.error)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
