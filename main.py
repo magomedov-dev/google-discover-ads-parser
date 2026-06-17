@@ -166,6 +166,8 @@ class GoogleParser:
     AD_DWELL_MAX: float = 5.0
     #: Сколько раз жмём back, возвращаясь из рекламы в ленту, прежде чем сдаться.
     BACK_ATTEMPTS: int = 5
+    #: Сколько свайпов делать после рекламы (в т.ч. пропущенной), чтобы не найти её снова.
+    POST_AD_SWIPES: int = 2
     #: Маркеры видео-рекламы в ``resource_id`` (видео — WebView внутри video_frame).
     VIDEO_ID_MARKERS: tuple[str, ...] = ("video_frame", "duration_badge", "webx_web_view")
     #: Классы видео-плеера в карточке.
@@ -771,18 +773,16 @@ class GoogleParser:
         return match.group(0) if match else None
 
     async def _grab_landing_url(self) -> str | None:
-        """Снять ссылку на сайт рекламы через диалог «Share link» Chrome.
+        """Снять ссылку на сайт рекламы через кнопку «Share link» в тулбаре Chrome.
 
-        Тапаем тулбар → «Share link» → читаем превью-текст (там ссылка) → возвращаемся
-        к Chrome. Best-effort: при сбое возвращаем ``None``.
+        Дожидаемся тулбара, тапаем именно кнопку «Share link» (а не центр тулбара,
+        где сама ссылка), читаем превью-текст со ссылкой и возвращаемся к Chrome.
+        Best-effort: при сбое возвращаем ``None``.
         """
         try:
-            bar = await self.device.wait_for(
-                GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT
-            )
-            if bar.center is not None:
-                await self.device.tap(bar.center.x, bar.center.y)
+            await self.device.wait_for(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
 
+            # Кнопка «Share link» в тулбаре — тапаем её, а не центр тулбара (ссылку).
             share = await self.device.wait_for(
                 GoogleSelectors.SHARE_LINK, timeout=self.READY_TIMEOUT
             )
@@ -984,7 +984,10 @@ class GoogleParser:
         if sponsored is not None:
             await self.process_ad(sponsored)
 
-        await self.swipe_forward()  # пропускаем рекламу, чтобы не найти её снова
+        # Несколько свайпов, чтобы уехать от рекламы (в т.ч. пропущенной Google Play)
+        # и не найти её снова.
+        for _ in range(self.POST_AD_SWIPES):
+            await self.swipe_forward()
 
     async def parse_feed(self, swipes: int = 25) -> None:
         """Листать ленту, собирая рекламу.
@@ -1106,7 +1109,7 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     async with FleetController.from_config("fleet.toml") as fleet:
-        results = await fleet.run(dump, targets="demo")
+        results = await fleet.run(google_parser, targets="demo")
 
     for serial, outcome in results.items():
         if outcome.ok:
@@ -1115,4 +1118,5 @@ async def main() -> None:
             logger.error("[%s] прогон упал: %s", serial, outcome.error)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
