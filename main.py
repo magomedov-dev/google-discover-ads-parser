@@ -67,10 +67,18 @@ class GoogleSelectors:
     SHARE_LINK = Selector.desc("Share link")
     #: Текст превью в системном диалоге шеринга — содержит ссылку на сайт рекламы.
     SHARE_PREVIEW_TEXT = Selector.id("android:id/content_preview_text")
+    #: Адресная строка Chrome — тап открывает информацию о странице (page info).
+    CHROME_URL_BAR = Selector.id("com.android.chrome:id/url_bar")
+    #: Усечённый домен в попапе page info — тап по нему раскрывает полный URL.
+    PAGE_INFO_TRUNCATED_URL = Selector.id("com.android.chrome:id/page_info_truncated_url")
+    #: Полный URL лендинга в попапе page info (появляется после тапа по усечённому).
+    PAGE_INFO_URL = Selector.id("com.android.chrome:id/page_info_url")
     #: Контейнер видео-плеера (внутри WebView рекламы-видео).
     PLAYER_CONTAINER = Selector.id("playerContainer")
     #: Поле со ссылкой на видео в диалоге «Поделиться» плеера.
     VIDEO_SHARE_URL = Selector.id("unified-share-url-input:0")
+    #: Любое редактируемое поле (для вставки буфера и чтения).
+    EDIT_TEXT = Selector.cls("android.widget.EditText")
 
 
 def save_node(node: UiNode, path: Path) -> None:
@@ -703,14 +711,16 @@ class GoogleParser:
         )
 
         # 5. Открытие рекламы и сбор ссылок (Google Play — пропускаем открытие).
-        landing_url: str | None = None
+        page_url: str | None = None  # реальный (полный) URL лендинга
+        landing_url: str | None = None  # google-style share-ссылка
         video_url: str | None = None
         if info.is_google_play:
             logger.info("[%s] реклама ведёт на Google Play — не открываю", self.device.serial)
         elif await self._open_ad(info, card):
             try:
                 await self._wait_ad_loaded()
-                landing_url = await self._grab_landing_url()
+                page_url = await self._grab_page_url()  # из page info
+                landing_url = await self._grab_landing_url()  # google-style
                 if info.form == "video":
                     video_url = await self._grab_video_url()
             except AxonError as exc:
@@ -725,6 +735,7 @@ class GoogleParser:
                     "text": info.text,
                     "channel": info.channel,
                     "google_play": info.is_google_play,
+                    "page_url": page_url,
                     "landing_url": landing_url,
                     "video_url": video_url,
                 },
@@ -772,6 +783,47 @@ class GoogleParser:
         match = re.search(r"https?://\S+", text)
         return match.group(0) if match else None
 
+    async def _grab_page_url(self) -> str | None:
+        """Снять полный URL лендинга через попап «информация о странице».
+
+        Тапаем адресную строку (``url_bar``) — открывается попап page info с усечённым
+        до домена адресом; тапаем по нему (``page_info_truncated_url``), чтобы раскрыть
+        полный адрес, и читаем его из ``page_info_url``. Попап закрываем в любом случае,
+        иначе он перекроет тулбар и сломает следующий шаг. Best-effort: при сбое —
+        ``None``.
+        """
+        try:
+            # Короткий таймаут: page-info — необязательный шаг, флак не должен съедать
+            # 15с и ломать сбор основной ссылки.
+            bar = await self.device.wait_for(
+                GoogleSelectors.CHROME_URL_BAR, timeout=self.AD_LOAD_TIMEOUT
+            )
+            if bar.center is not None:
+                await self.device.tap(bar.center.x, bar.center.y)
+            try:
+                # Тап по усечённому домену раскрывает полный URL.
+                truncated = await self.device.wait_for(
+                    GoogleSelectors.PAGE_INFO_TRUNCATED_URL, timeout=self.AD_LOAD_TIMEOUT
+                )
+                if truncated.center is not None:
+                    await self.device.tap(truncated.center.x, truncated.center.y)
+                    await asyncio.sleep(self.SETTLE)
+
+                url_node = await self.device.wait_for(
+                    GoogleSelectors.PAGE_INFO_URL, timeout=self.AD_LOAD_TIMEOUT
+                )
+                url = (
+                    self._extract_url(url_node.text or "") or (url_node.text or "").strip() or None
+                )
+                logger.info("[%s] полный URL лендинга: %s", self.device.serial, url)
+                return url
+            finally:
+                # Попап перекрывает тулбар — закрываем его (back до Chrome).
+                await self._back_until(GoogleSelectors.CHROME_TOOL_BAR)
+        except AxonError as exc:
+            logger.warning("[%s] не удалось получить URL лендинга: %s", self.device.serial, exc)
+            return None
+
     async def _grab_landing_url(self) -> str | None:
         """Снять ссылку на сайт рекламы через кнопку «Share link» в тулбаре Chrome.
 
@@ -802,11 +854,27 @@ class GoogleParser:
             logger.warning("[%s] не удалось получить ссылку на сайт: %s", self.device.serial, exc)
             return None
 
-    async def _grab_video_url(self) -> str | None:
-        """Снять ссылку на видео через диалог «Поделиться» плеера.
+    @staticmethod
+    def _seekbar(player: UiNode) -> UiNode | None:
+        """Найти ``SeekBar`` в поддереве плеера (с границами)."""
+        return next(
+            (
+                n
+                for n in player.descendants()
+                if (n.class_name or "").endswith("SeekBar") and n.bounds
+            ),
+            None,
+        )
 
-        Закрываем сайт (close_button), в плеере под полосой прокрутки слева тапаем
-        кнопку «Поделиться» и читаем поле со ссылкой. Best-effort.
+    async def _grab_video_url(self) -> str | None:
+        """Снять ссылку на видео через кнопку под полосой прокрутки плеера.
+
+        Закрываем сайт (close_button) → плеер появляется с задержкой и в отдельном
+        окне WebView, ищем его через ``device.find``. В контролах под ``SeekBar`` слева
+        находится кнопка действия — берём её по геометрии (самый левый кликабельный
+        узел ниже полосы), без привязки к подписи. После тапа: если открылся диалог с
+        полем ``unified-share-url-input:0`` — читаем ссылку из него; если это была
+        «Копировать ссылку» — читаем буфер обмена. Всё best-effort.
         """
         try:
             close = await self.device.wait_for(
@@ -814,52 +882,90 @@ class GoogleParser:
             )
             if close.center is not None:
                 await self.device.tap(close.center.x, close.center.y)
+            await asyncio.sleep(self.SETTLE * 2)  # плееру нужно время появиться
 
-            tree = await self.device.dump()
-            player = tree.find(GoogleSelectors.PLAYER_CONTAINER)
-            if player is None:
+            # Плеер — в отдельном окне WebView: ищем через device.find, а не в дампе.
+            player = await self.device.find(GoogleSelectors.PLAYER_CONTAINER)
+            if player is None or player.center is None:
                 logger.warning("[%s] плеер не найден — нет ссылки на видео", self.device.serial)
                 return None
 
-            seek = next(
-                (
-                    n
-                    for n in player.descendants()
-                    if (n.class_name or "").endswith("SeekBar") and n.bounds
-                ),
-                None,
-            )
-            if seek is None or seek.bounds is None:
+            # Полоса прокрутки видна только при показанных контролах. Нет — тап по
+            # плееру их показывает (повторный тап их бы скрыл).
+            seek = self._seekbar(player)
+            if seek is None:
+                await self.device.tap(player.center.x, player.center.y)
+                await asyncio.sleep(self.SETTLE)
+                player = await self.device.find(GoogleSelectors.PLAYER_CONTAINER)
+                seek = self._seekbar(player) if player is not None else None
+            if player is None or seek is None or seek.bounds is None:
                 logger.warning("[%s] полоса прокрутки плеера не найдена", self.device.serial)
                 return None
 
-            # Кнопка «Поделиться» — кликабельный узел под полосой, в левой части.
-            share = min(
+            # Кнопка действия — самый левый кликабельный узел под полосой прокрутки.
+            button = min(
                 (
                     n
                     for n in player.descendants()
-                    if n.clickable
-                    and n.center is not None
-                    and n.bounds is not None
-                    and n.bounds.top >= seek.bounds.bottom
+                    if n.clickable and n.center is not None and n.center.y > seek.bounds.bottom
                 ),
                 key=lambda n: n.center.x,  # type: ignore[union-attr]
                 default=None,
             )
-            if share is None or share.center is None:
-                logger.warning("[%s] кнопка «Поделиться» видео не найдена", self.device.serial)
+            if button is None or button.center is None:
+                logger.warning("[%s] кнопка под полосой прокрутки не найдена", self.device.serial)
                 return None
+            await self.device.tap(button.center.x, button.center.y)
 
-            await self.device.tap(share.center.x, share.center.y)
-            field = await self.device.wait_for(
-                GoogleSelectors.VIDEO_SHARE_URL, timeout=self.READY_TIMEOUT
-            )
-            url = (field.text or "").strip() or None
-            logger.info("[%s] ссылка на видео: %s", self.device.serial, url)
+            # Если это «Поделиться» — появится диалог с полем ссылки (даём ему время).
+            # Если поле не появилось — это была «Копировать ссылку», читаем буфер.
+            try:
+                field = await self.device.wait_for(
+                    GoogleSelectors.VIDEO_SHARE_URL, timeout=self.AD_LOAD_TIMEOUT
+                )
+            except WaitTimeout:
+                field = None
+            if field is not None:
+                url = self._extract_url(field.text or "") or (field.text or "").strip() or None
+                logger.info("[%s] ссылка на видео (поделиться): %s", self.device.serial, url)
+                return url
+            url = await self._read_clipboard()
+            logger.info("[%s] ссылка на видео (буфер): %s", self.device.serial, url)
             return url
         except AxonError as exc:
             logger.warning("[%s] не удалось получить ссылку на видео: %s", self.device.serial, exc)
             return None
+
+    async def _read_clipboard(self) -> str | None:
+        """Прочитать буфер обмена через вставку в поле поиска.
+
+        Прямого чтения буфера на устройстве нет (cmd clipboard не реализован,
+        Android блокирует фоновое чтение), поэтому возвращаемся в ленту, фокусируем
+        строку поиска, вставляем буфер (KEYCODE_PASTE) и читаем текст поля. За собой
+        очищаем поле и закрываем поиск. Best-effort.
+        """
+        if not await self._back_until(GoogleSelectors.FEED):
+            return None
+        box = await self.device.find(GoogleSelectors.SEARCH)
+        if box is None or box.center is None:
+            return None
+
+        await self.device.tap(box.center.x, box.center.y)
+        await asyncio.sleep(self.SETTLE)
+        if await self.device.find(GoogleSelectors.EDIT_TEXT) is None:
+            return None
+
+        await self.device.set_text(GoogleSelectors.EDIT_TEXT, "")
+        adb = self.device._require_adb()
+        await adb.shell(self.device.serial, "input keyevent 279")  # KEYCODE_PASTE
+        await asyncio.sleep(self.SETTLE)
+
+        field = await self.device.find(GoogleSelectors.EDIT_TEXT)
+        text = (field.text or "") if field is not None else ""
+
+        await self.device.set_text(GoogleSelectors.EDIT_TEXT, "")  # убираем за собой
+        await self.device.global_action("back")  # закрыть клавиатуру/поиск
+        return self._extract_url(text)
 
     async def _back_until(self, selector: Selector, attempts: int | None = None) -> bool:
         """Жать back, пока на экране не появится ``selector`` (или не кончатся попытки)."""
