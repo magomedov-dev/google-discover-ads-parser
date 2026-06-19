@@ -69,8 +69,10 @@ class GoogleSelectors:
     SHARE_PREVIEW_TEXT = Selector.id("android:id/content_preview_text")
     #: Адресная строка Chrome — тап открывает информацию о странице (page info).
     CHROME_URL_BAR = Selector.id("com.android.chrome:id/url_bar")
-    #: Реальный домен лендинга в попапе «информация о странице» (усечён до домена).
-    PAGE_INFO_URL = Selector.id("com.android.chrome:id/page_info_truncated_url")
+    #: Усечённый домен в попапе page info — тап по нему раскрывает полный URL.
+    PAGE_INFO_TRUNCATED_URL = Selector.id("com.android.chrome:id/page_info_truncated_url")
+    #: Полный URL лендинга в попапе page info (появляется после тапа по усечённому).
+    PAGE_INFO_URL = Selector.id("com.android.chrome:id/page_info_url")
     #: Контейнер видео-плеера (внутри WebView рекламы-видео).
     PLAYER_CONTAINER = Selector.id("playerContainer")
     #: Поле со ссылкой на видео в диалоге «Поделиться» плеера.
@@ -782,12 +784,13 @@ class GoogleParser:
         return match.group(0) if match else None
 
     async def _grab_page_url(self) -> str | None:
-        """Снять реальный домен лендинга через попап «информация о странице».
+        """Снять полный URL лендинга через попап «информация о странице».
 
-        Тапаем адресную строку (``url_bar``) — открывается попап с информацией о
-        странице; читаем домен из ``page_info_truncated_url`` (полный URL там не
-        показывается — он усечён до домена). Попап закрываем в любом случае, иначе он
-        перекроет тулбар и сломает следующий шаг. Best-effort: при сбое — ``None``.
+        Тапаем адресную строку (``url_bar``) — открывается попап page info с усечённым
+        до домена адресом; тапаем по нему (``page_info_truncated_url``), чтобы раскрыть
+        полный адрес, и читаем его из ``page_info_url``. Попап закрываем в любом случае,
+        иначе он перекроет тулбар и сломает следующий шаг. Best-effort: при сбое —
+        ``None``.
         """
         try:
             # Короткий таймаут: page-info — необязательный шаг, флак не должен съедать
@@ -798,17 +801,27 @@ class GoogleParser:
             if bar.center is not None:
                 await self.device.tap(bar.center.x, bar.center.y)
             try:
+                # Тап по усечённому домену раскрывает полный URL.
+                truncated = await self.device.wait_for(
+                    GoogleSelectors.PAGE_INFO_TRUNCATED_URL, timeout=self.AD_LOAD_TIMEOUT
+                )
+                if truncated.center is not None:
+                    await self.device.tap(truncated.center.x, truncated.center.y)
+                    await asyncio.sleep(self.SETTLE)
+
                 url_node = await self.device.wait_for(
                     GoogleSelectors.PAGE_INFO_URL, timeout=self.AD_LOAD_TIMEOUT
                 )
-                url = (url_node.text or "").strip() or None
-                logger.info("[%s] домен лендинга: %s", self.device.serial, url)
+                url = (
+                    self._extract_url(url_node.text or "") or (url_node.text or "").strip() or None
+                )
+                logger.info("[%s] полный URL лендинга: %s", self.device.serial, url)
                 return url
             finally:
                 # Попап перекрывает тулбар — закрываем его (back до Chrome).
                 await self._back_until(GoogleSelectors.CHROME_TOOL_BAR)
         except AxonError as exc:
-            logger.warning("[%s] не удалось получить домен лендинга: %s", self.device.serial, exc)
+            logger.warning("[%s] не удалось получить URL лендинга: %s", self.device.serial, exc)
             return None
 
     async def _grab_landing_url(self) -> str | None:
