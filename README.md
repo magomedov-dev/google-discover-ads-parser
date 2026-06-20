@@ -36,6 +36,44 @@
 uv sync
 ```
 
+## Подготовка устройства (обязательно)
+
+Перед запуском устройство нужно подготовить — иначе парсер может работать
+некорректно:
+
+1. **Английский язык интерфейса** — парсер опирается на англоязычные подписи
+   (`Sponsored`, `Home` и т.п.). Settings → System → Languages → English.
+2. **Выключить жесты навигации** (трёхкнопочный режим) — чтобы edge-свайпы не
+   срабатывали во время листания.
+3. **Выключить уведомления** (режим «Не беспокоить») — всплывашки ломают ленту.
+4. **Выключить анимации** (по желанию) — стабильнее и быстрее.
+5. **Выключить автоповорот экрана** (зафиксировать портрет) — в ландшафте ленты
+   Discover нет.
+6. **Выключить отключение экрана при бездействии** (пока подключено к ПК) — иначе
+   экран гаснет во время долгого прогона.
+
+Пункты 2–6 можно применить через adb (язык — вручную в настройках):
+
+```bash
+# 2. трёхкнопочная навигация (без жестов)
+adb shell cmd overlay enable com.android.internal.systemui.navbar.threebutton
+adb shell settings put secure navigation_mode 0
+# 3. «Не беспокоить»
+adb shell cmd notification set_dnd on
+# 4. анимации (по желанию)
+adb shell settings put global window_animation_scale 0
+adb shell settings put global transition_animation_scale 0
+adb shell settings put global animator_duration_scale 0
+# 5. портрет без автоповорота
+adb shell settings put system accelerometer_rotation 0
+adb shell settings put system user_rotation 0
+# 6. не гасить экран при подключении к ПК
+adb shell settings put global stay_on_while_plugged_in 3
+```
+
+> Команды best-effort: на части прошивок (например MIUI) отдельные настройки могут
+> не примениться — выставь их вручную.
+
 ## Запуск
 
 ```bash
