@@ -1039,9 +1039,10 @@ class GoogleParser:
             return None
 
         # После возврата из плеера лента прокручена и строка поиска свёрнута/смещена.
-        # Свайпом вниз (лента вверх) на вертикальный размер SEARCH возвращаем её на
-        # место, иначе тап по ней не открывает поиск и вставка не срабатывает.
-        reveal = self._search_bounds.bottom - self._search_bounds.top
+        # Свайпом вниз (лента вверх) на расстояние от 0 до нижней границы SEARCH
+        # возвращаем её на место, иначе тап по ней не открывает поиск и вставка
+        # не срабатывает.
+        reveal = self._search_bounds.bottom
         cx = self.working_bounds.center.x
         await self.device.swipe(
             cx, self.working_bounds.top, cx, self.working_bounds.top + reveal, duration=reveal
