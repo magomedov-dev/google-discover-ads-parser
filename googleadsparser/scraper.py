@@ -33,6 +33,7 @@ from axonctl import (
 )
 from PIL import Image
 
+from .config import ScrapeConfig
 from .debug import save_node
 from .models import AdInfo
 from .selectors import GoogleSelectors
@@ -46,53 +47,37 @@ class GoogleParser:
     Экземпляр привязан к конкретному устройству (создаётся по одному на устройство,
     чтобы не делить изменяемое состояние между параллельными прогонами).
 
+    Args:
+        device: Устройство, на котором работает парсер.
+        config: Настраиваемые параметры скрейпинга.
+
     Attributes:
         device: Управляемое устройство.
+        config: Параметры скрейпинга (:class:`~googleadsparser.config.ScrapeConfig`).
         working_bounds: Рабочая область ленты; вычисляется в :meth:`get_working_bounds`.
     """
 
+    #: Пакет приложения Google (его и парсим).
     APP: str = "com.google.android.googlequicksearchbox"
     #: Chrome — открывается при случайном тапе по рекламе; его надо закрывать.
     CHROME_APP: str = "com.android.chrome"
-    #: Корневой каталог для собранной рекламы (по подкаталогу на устройство).
-    OUTPUT_DIR: Path = Path("ads")
-    #: Допуск выравнивания низа рекламы (px) — меньше уже не доскролливаем.
-    ALIGN_TOLERANCE: int = 20
-    #: Ожидание появления элементов (медленный старт / плохой интернет), с.
-    READY_TIMEOUT: float = 15.0
-    #: Сколько ждём загрузки сайта рекламы; дольше — закрываем и листаем дальше, с.
-    AD_LOAD_TIMEOUT: float = 3.0
-    #: Сколько «смотрим» сайт рекламы после загрузки перед закрытием (случайно), с.
-    AD_DWELL_MIN: float = 2.0
-    AD_DWELL_MAX: float = 5.0
-    #: Сколько раз жмём back, возвращаясь из рекламы в ленту, прежде чем сдаться.
-    BACK_ATTEMPTS: int = 5
-    #: Сколько свайпов делать после рекламы (в т.ч. пропущенной), чтобы не найти её снова.
-    POST_AD_SWIPES: int = 2
     #: Маркеры видео-рекламы в ``resource_id`` (видео — WebView внутри video_frame).
     VIDEO_ID_MARKERS: tuple[str, ...] = ("video_frame", "duration_badge", "webx_web_view")
     #: Классы видео-плеера в карточке.
     VIDEO_CLASSES: tuple[str, ...] = ("VideoView", "SurfaceView", "TextureView")
     #: Классы контейнера карусели (несколько креативов в одном объявлении).
     CAROUSEL_CLASSES: tuple[str, ...] = ("RecyclerView", "ViewPager")
-    #: Минимальная высота медиа-области (px), иначе считаем, что её нет.
-    MIN_MEDIA_HEIGHT: int = 80
-    #: Базовая пауза «дать UI/ленте успокоиться», с.
-    SETTLE: float = 0.5
-    #: Сколько максимум ждать, пока лента догрузится и перестанет двигаться, с.
-    SETTLE_TIMEOUT: float = 8.0
-    #: Столько одинаковых дампов подряд считаем «лента успокоилась».
-    SETTLE_STABLE: int = 2
-    #: Попыток запустить приложение, прежде чем сдаться.
-    LAUNCH_ATTEMPTS: int = 3
 
-    def __init__(self, device: Device) -> None:
+    def __init__(self, device: Device, config: ScrapeConfig | None = None) -> None:
         """Инициализировать парсер для конкретного устройства.
 
         Args:
             device: Устройство, на котором будет работать парсер.
+            config: Параметры скрейпинга; ``None`` — значения по умолчанию.
         """
         self.device = device
+        #: Параметры скрейпинга.
+        self.config = config or ScrapeConfig()
         #: Реальная ширина экрана в пикселях; заполняется в :meth:`capture_screen_size`.
         self.screen_width: int
         #: Реальная высота экрана в пикселях; заполняется в :meth:`capture_screen_size`.
@@ -102,7 +87,7 @@ class GoogleParser:
         #: Последний снятый UI-дамп; обновляется по ходу листания.
         self._root: UiTree
         #: Каталог собранной рекламы для этого устройства.
-        self._out_dir = self.OUTPUT_DIR / device.serial
+        self._out_dir = self.config.output_dir / device.serial
         #: Счётчик сохранённых реклам — продолжается с последней на диске (переживает перезапуск).
         self._ad_count: int = self._last_ad_index()
         #: Уже обработанные рекламы (канал + заголовок) — чтобы не собирать дубли.
@@ -142,10 +127,10 @@ class GoogleParser:
         """
         logger.info("[%s] запускаю %s", self.device.serial, self.APP)
         await self.device.launch(self.APP)
-        await self.device.wait_activity(self.APP, timeout=self.READY_TIMEOUT)
-        await self.device.wait_package(self.APP, timeout=self.READY_TIMEOUT)
-        await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
-        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.READY_TIMEOUT)
+        await self.device.wait_activity(self.APP, timeout=self.config.ready_timeout)
+        await self.device.wait_package(self.APP, timeout=self.config.ready_timeout)
+        await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.config.ready_timeout)
+        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.config.ready_timeout)
         logger.info("[%s] %s на переднем плане", self.device.serial, self.APP)
 
     async def is_chrome_open(self) -> bool:
@@ -163,7 +148,9 @@ class GoogleParser:
         logger.warning("[%s] открылся Chrome — закрываю", self.device.serial)
         try:
             await self.device.kill(self.CHROME_APP)
-            await self.device.wait_gone(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
+            await self.device.wait_gone(
+                GoogleSelectors.CHROME_TOOL_BAR, timeout=self.config.ready_timeout
+            )
         except AxonError as exc:
             logger.warning("[%s] не удалось закрыть Chrome: %s", self.device.serial, exc)
 
@@ -177,7 +164,7 @@ class GoogleParser:
         await self.close_chrome()
         try:
             await self.device.kill(self.APP)
-            await self.device.wait_gone(GoogleSelectors.ROOT, timeout=self.READY_TIMEOUT)
+            await self.device.wait_gone(GoogleSelectors.ROOT, timeout=self.config.ready_timeout)
             logger.info("[%s] %s закрыт", self.device.serial, self.APP)
         except AxonError as exc:
             logger.warning("[%s] не удалось чисто закрыть приложение: %s", self.device.serial, exc)
@@ -219,7 +206,7 @@ class GoogleParser:
             axonctl.WaitTimeout: Если лента не появилась за :attr:`READY_TIMEOUT`.
         """
         # Дождаться ленты на случай медленной прогрузки после холодного старта.
-        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.READY_TIMEOUT)
+        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.config.ready_timeout)
 
         root = await self.device.dump()
         feed = root.find(GoogleSelectors.FEED)
@@ -241,7 +228,9 @@ class GoogleParser:
         )
 
         # Ждём строку поиска (а не мгновенный find) — после свайпа дерево перестраивается.
-        search = await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
+        search = await self.device.wait_for(
+            GoogleSelectors.SEARCH, timeout=self.config.ready_timeout
+        )
         if search.bounds is None:
             raise RuntimeError("у строки поиска нет границ после свайпа")
 
@@ -322,26 +311,26 @@ class GoogleParser:
         Raises:
             axonctl.WaitTimeout: Если лента не появилась за :attr:`READY_TIMEOUT`.
         """
-        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.READY_TIMEOUT)
+        await self.device.wait_for(GoogleSelectors.FEED, timeout=self.config.ready_timeout)
 
         prev: tuple[str, int] | None = None
         stable = 0
         tree = await self.device.dump()
-        for _ in range(max(1, int(self.SETTLE_TIMEOUT / self.SETTLE))):
+        for _ in range(max(1, int(self.config.settle_timeout / self.config.settle))):
             tree = await self.device.dump()
             sig = self._feed_signature(tree)
             if sig is not None and sig == prev:
                 stable += 1
-                if stable >= self.SETTLE_STABLE:
+                if stable >= self.config.settle_stable:
                     logger.debug("[%s] лента успокоилась", self.device.serial)
                     break
             else:
                 stable = 0
             prev = sig
-            await asyncio.sleep(self.SETTLE)
+            await asyncio.sleep(self.config.settle)
         else:
             logger.debug(
-                "[%s] лента не успокоилась за %.1fс", self.device.serial, self.SETTLE_TIMEOUT
+                "[%s] лента не успокоилась за %.1fс", self.device.serial, self.config.settle_timeout
             )
         return tree
 
@@ -405,7 +394,7 @@ class GoogleParser:
         distance = self.working_bounds.bottom - target_bottom
 
         logger.debug("[%s] довожу рекламу вниз на %dpx", self.device.serial, distance)
-        while distance >= self.ALIGN_TOLERANCE:
+        while distance >= self.config.align_tolerance:
             step = min(distance, span)
             await self._swipe(y_top, y_top + step)
             distance -= step
@@ -594,7 +583,7 @@ class GoogleParser:
         media_box = None
         if media_bottom is not None:
             media_bottom_box = min(media_bottom, ws.bottom)
-            if media_bottom_box - top >= self.MIN_MEDIA_HEIGHT:
+            if media_bottom_box - top >= self.config.min_media_height:
                 media_box = (card.bounds.left, top, card.bounds.right, media_bottom_box)
         return card_box, media_box, media_bottom
 
@@ -744,16 +733,20 @@ class GoogleParser:
 
     async def _wait_ad_loaded(self) -> None:
         """Дождаться Chrome и загрузки сайта рекламы (с ограничением), затем «посмотреть»."""
-        await self.device.wait_for(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
+        await self.device.wait_for(
+            GoogleSelectors.CHROME_TOOL_BAR, timeout=self.config.ready_timeout
+        )
         try:
             await self.device.wait_gone(
-                GoogleSelectors.CHROME_PROGRESS_BAR, timeout=self.AD_LOAD_TIMEOUT
+                GoogleSelectors.CHROME_PROGRESS_BAR, timeout=self.config.ad_load_timeout
             )
         except WaitTimeout:
             logger.info(
-                "[%s] сайт рекламы грузится дольше %.0fс", self.device.serial, self.AD_LOAD_TIMEOUT
+                "[%s] сайт рекламы грузится дольше %.0fс",
+                self.device.serial,
+                self.config.ad_load_timeout,
             )
-        dwell = random.uniform(self.AD_DWELL_MIN, self.AD_DWELL_MAX)
+        dwell = random.uniform(self.config.ad_dwell_min, self.config.ad_dwell_max)
         logger.info("[%s] смотрю сайт рекламы %.1fс", self.device.serial, dwell)
         await asyncio.sleep(dwell)
 
@@ -776,21 +769,21 @@ class GoogleParser:
             # Короткий таймаут: page-info — необязательный шаг, флак не должен съедать
             # 15с и ломать сбор основной ссылки.
             bar = await self.device.wait_for(
-                GoogleSelectors.CHROME_URL_BAR, timeout=self.AD_LOAD_TIMEOUT
+                GoogleSelectors.CHROME_URL_BAR, timeout=self.config.ad_load_timeout
             )
             if bar.center is not None:
                 await self.device.tap(bar.center.x, bar.center.y)
             try:
                 # Тап по усечённому домену раскрывает полный URL.
                 truncated = await self.device.wait_for(
-                    GoogleSelectors.PAGE_INFO_TRUNCATED_URL, timeout=self.AD_LOAD_TIMEOUT
+                    GoogleSelectors.PAGE_INFO_TRUNCATED_URL, timeout=self.config.ad_load_timeout
                 )
                 if truncated.center is not None:
                     await self.device.tap(truncated.center.x, truncated.center.y)
-                    await asyncio.sleep(self.SETTLE)
+                    await asyncio.sleep(self.config.settle)
 
                 url_node = await self.device.wait_for(
-                    GoogleSelectors.PAGE_INFO_URL, timeout=self.AD_LOAD_TIMEOUT
+                    GoogleSelectors.PAGE_INFO_URL, timeout=self.config.ad_load_timeout
                 )
                 url = (
                     self._extract_url(url_node.text or "") or (url_node.text or "").strip() or None
@@ -812,17 +805,19 @@ class GoogleParser:
         Best-effort: при сбое возвращаем ``None``.
         """
         try:
-            await self.device.wait_for(GoogleSelectors.CHROME_TOOL_BAR, timeout=self.READY_TIMEOUT)
+            await self.device.wait_for(
+                GoogleSelectors.CHROME_TOOL_BAR, timeout=self.config.ready_timeout
+            )
 
             # Кнопка «Share link» в тулбаре — тапаем её, а не центр тулбара (ссылку).
             share = await self.device.wait_for(
-                GoogleSelectors.SHARE_LINK, timeout=self.READY_TIMEOUT
+                GoogleSelectors.SHARE_LINK, timeout=self.config.ready_timeout
             )
             if share.center is not None:
                 await self.device.tap(share.center.x, share.center.y)
 
             preview = await self.device.wait_for(
-                GoogleSelectors.SHARE_PREVIEW_TEXT, timeout=self.READY_TIMEOUT
+                GoogleSelectors.SHARE_PREVIEW_TEXT, timeout=self.config.ready_timeout
             )
             url = self._extract_url(preview.text or "")
             logger.info("[%s] ссылка на сайт: %s", self.device.serial, url)
@@ -858,11 +853,11 @@ class GoogleParser:
         """
         try:
             close = await self.device.wait_for(
-                GoogleSelectors.CHROME_CLOSE, timeout=self.READY_TIMEOUT
+                GoogleSelectors.CHROME_CLOSE, timeout=self.config.ready_timeout
             )
             if close.center is not None:
                 await self.device.tap(close.center.x, close.center.y)
-            await asyncio.sleep(self.SETTLE * 2)  # плееру нужно время появиться
+            await asyncio.sleep(self.config.settle * 2)  # плееру нужно время появиться
 
             # Плеер — в отдельном окне WebView: ищем через device.find, а не в дампе.
             player = await self.device.find(GoogleSelectors.PLAYER_CONTAINER)
@@ -876,8 +871,8 @@ class GoogleParser:
             seek = self._seekbar(player)
             if seek is None:
                 await self.device.tap(player.center.x, player.center.y)
-                for _ in range(max(1, int(self.AD_LOAD_TIMEOUT / self.SETTLE))):
-                    await asyncio.sleep(self.SETTLE)
+                for _ in range(max(1, int(self.config.ad_load_timeout / self.config.settle))):
+                    await asyncio.sleep(self.config.settle)
                     player = await self.device.find(GoogleSelectors.PLAYER_CONTAINER)
                     if player is None:
                         break
@@ -907,7 +902,7 @@ class GoogleParser:
             # Если поле не появилось — это была «Копировать ссылку», читаем буфер.
             try:
                 field = await self.device.wait_for(
-                    GoogleSelectors.VIDEO_SHARE_URL, timeout=self.AD_LOAD_TIMEOUT
+                    GoogleSelectors.VIDEO_SHARE_URL, timeout=self.config.ad_load_timeout
                 )
             except WaitTimeout:
                 field = None
@@ -937,14 +932,14 @@ class GoogleParser:
             return None
 
         await self.device.tap(box.center.x, box.center.y)
-        await asyncio.sleep(self.SETTLE)
+        await asyncio.sleep(self.config.settle)
         if await self.device.find(GoogleSelectors.EDIT_TEXT) is None:
             return None
 
         await self.device.set_text(GoogleSelectors.EDIT_TEXT, "")
         adb = self.device._require_adb()
         await adb.shell(self.device.serial, "input keyevent 279")  # KEYCODE_PASTE
-        await asyncio.sleep(self.SETTLE)
+        await asyncio.sleep(self.config.settle)
 
         field = await self.device.find(GoogleSelectors.EDIT_TEXT)
         text = (field.text or "") if field is not None else ""
@@ -955,12 +950,12 @@ class GoogleParser:
 
     async def _back_until(self, selector: Selector, attempts: int | None = None) -> bool:
         """Жать back, пока на экране не появится ``selector`` (или не кончатся попытки)."""
-        attempts = attempts or self.BACK_ATTEMPTS
+        attempts = attempts or self.config.back_attempts
         for _ in range(attempts):
             if await self.device.find(selector) is not None:
                 return True
             await self.device.global_action("back")
-            await asyncio.sleep(self.SETTLE)
+            await asyncio.sleep(self.config.settle)
         return await self.device.find(selector) is not None
 
     async def _back_to_feed(self) -> None:
@@ -971,7 +966,7 @@ class GoogleParser:
             logger.warning(
                 "[%s] не удалось вернуться в ленту за %d back",
                 self.device.serial,
-                self.BACK_ATTEMPTS,
+                self.config.back_attempts,
             )
 
     # --------------------------------------------------------------------- #
@@ -1001,18 +996,20 @@ class GoogleParser:
 
         poll = 0.2
         # Появление индикатора (обновление началось).
-        for _ in range(int(self.READY_TIMEOUT / poll)):
+        for _ in range(int(self.config.ready_timeout / poll)):
             if await present():
                 break
             await asyncio.sleep(poll)
         # Исчезновение индикатора (обновление завершилось).
-        for _ in range(int(self.READY_TIMEOUT / poll)):
+        for _ in range(int(self.config.ready_timeout / poll)):
             if not await present():
                 logger.info("[%s] обновление ленты завершилось", self.device.serial)
                 return
             await asyncio.sleep(poll)
         logger.warning(
-            "[%s] индикатор обновления не исчез за %.0fс", self.device.serial, self.READY_TIMEOUT
+            "[%s] индикатор обновления не исчез за %.0fс",
+            self.device.serial,
+            self.config.ready_timeout,
         )
 
     async def update_feed(self) -> None:
@@ -1037,7 +1034,9 @@ class GoogleParser:
             # Вкладка «Home» не поддерживает a11y-action `click` (ACTION_NOT_SUPPORTED),
             # поэтому тапаем по её координатам. Первый тап — лента наверх, повторный
             # (когда уже наверху) — обновление.
-            home = await self.device.wait_for(Selector.text("Home"), timeout=self.READY_TIMEOUT)
+            home = await self.device.wait_for(
+                Selector.text("Home"), timeout=self.config.ready_timeout
+            )
             if home.center is None:
                 logger.warning("[%s] у вкладки Home нет координат", self.device.serial)
                 return
@@ -1046,7 +1045,9 @@ class GoogleParser:
             await self.device.tap(home.center.x, home.center.y)
             await self.device.tap(home.center.x, home.center.y)
             # Дождаться, что лента перерисовалась (вернулась строка поиска).
-            search = await self.device.wait_for(GoogleSelectors.SEARCH, timeout=self.READY_TIMEOUT)
+            search = await self.device.wait_for(
+                GoogleSelectors.SEARCH, timeout=self.config.ready_timeout
+            )
             await self.wait_feed_settled()
 
             # Pull-to-refresh: быстрый свайп сверху вниз в рабочей области.
@@ -1057,7 +1058,7 @@ class GoogleParser:
             if search.bounds is not None:
                 await self._wait_refresh_done(search.bounds.top)
 
-            await asyncio.sleep(self.SETTLE)
+            await asyncio.sleep(self.config.settle)
             logger.info("[%s] лента обновлена перед закрытием", self.device.serial)
         except AxonError as exc:
             logger.warning("[%s] не удалось обновить ленту: %s", self.device.serial, exc)
@@ -1084,18 +1085,20 @@ class GoogleParser:
 
         # Несколько свайпов, чтобы уехать от рекламы (в т.ч. пропущенной Google Play)
         # и не найти её снова.
-        for _ in range(self.POST_AD_SWIPES):
+        for _ in range(self.config.post_ad_swipes):
             await self.swipe_forward()
 
-    async def parse_feed(self, swipes: int = 25) -> None:
+    async def parse_feed(self, swipes: int | None = None) -> None:
         """Листать ленту, собирая рекламу.
 
         Каждая итерация изолирована: транзиентный сбой (таймаут загрузки, обрыв
         связи, устаревшее дерево) логируется и пропускается, не роняя всю сессию.
 
         Args:
-            swipes: Сколько свайпов (итераций) сделать за сессию.
+            swipes: Сколько свайпов (итераций) сделать за сессию; ``None`` — взять из
+                конфига (:attr:`~googleadsparser.config.ScrapeConfig.swipes`).
         """
+        swipes = swipes if swipes is not None else self.config.swipes
         logger.info("[%s] листаю ленту: %d свайпов", self.device.serial, swipes)
         for i in range(swipes):
             try:
@@ -1118,7 +1121,7 @@ class GoogleParser:
                     swipes,
                     exc,
                 )
-                await asyncio.sleep(self.SETTLE)
+                await asyncio.sleep(self.config.settle)
         logger.info("[%s] листание завершено", self.device.serial)
 
     async def _setup(self) -> None:
@@ -1128,7 +1131,7 @@ class GoogleParser:
             RuntimeError: Если приложение не удалось запустить за
                 :attr:`LAUNCH_ATTEMPTS` попыток.
         """
-        for attempt in range(1, self.LAUNCH_ATTEMPTS + 1):
+        for attempt in range(1, self.config.launch_attempts + 1):
             try:
                 await self.launch()
                 await self.capture_screen_size()
@@ -1140,11 +1143,11 @@ class GoogleParser:
                     "[%s] запуск, попытка %d/%d не удалась: %s",
                     self.device.serial,
                     attempt,
-                    self.LAUNCH_ATTEMPTS,
+                    self.config.launch_attempts,
                     exc,
                 )
                 await self.kill()  # сбрасываем состояние перед повтором
-                await asyncio.sleep(self.SETTLE * attempt)  # линейный backoff
+                await asyncio.sleep(self.config.settle * attempt)  # линейный backoff
         raise RuntimeError("не удалось запустить приложение после нескольких попыток")
 
     async def run(self) -> None:
@@ -1170,16 +1173,17 @@ class GoogleParser:
                 finally:
                     # Полностью закрываем приложение — следующий цикл откроет его заново.
                     await self.kill()
-                await asyncio.sleep(self.SETTLE)
+                await asyncio.sleep(self.config.settle)
         finally:
             await self.kill()
             logger.info("[%s] прогон остановлен", self.device.serial)
 
 
-async def google_parser(device: Device) -> None:
+async def google_parser(device: Device, config: ScrapeConfig | None = None) -> None:
     """Сценарий для :meth:`~axonctl.FleetController.run`: свежий парсер на устройство.
 
     Args:
         device: Устройство, переданное контроллером флота.
+        config: Параметры скрейпинга; ``None`` — значения по умолчанию.
     """
-    await GoogleParser(device).run()
+    await GoogleParser(device, config).run()

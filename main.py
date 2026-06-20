@@ -1,28 +1,117 @@
-"""Точка входа: запуск парсера рекламы Google Discover на устройствах флота.
+"""CLI-точка входа: запуск парсера рекламы Google Discover на устройствах.
 
-Сценарий и вся логика — в пакете :mod:`googleadsparser`. Здесь только настройка
-логирования и запуск через :class:`~axonctl.FleetController` над устройствами из
-``fleet.toml``.
+Параметры берутся из TOML-конфига (``config.toml`` по умолчанию) и/или флагов CLI;
+флаги имеют приоритет над конфигом. Флот собирается программно — отдельный
+``fleet.toml`` не нужен: устройства задаются ``--device`` / секцией ``[fleet]`` в
+конфиге, а при их отсутствии определяются автоматически через ``adb devices``.
+
+Примеры::
+
+    uv run main.py                          # все подключённые устройства, config.toml
+    uv run main.py --device 276bcca9        # конкретное устройство
+    uv run main.py --swipes 40 --concurrency 4
+    uv run main.py --config my.toml -o ads2
+    uv run main.py --list-devices           # показать подключённые устройства
 """
 
+import argparse
 import asyncio
 import logging
+import subprocess
+from dataclasses import replace
+from pathlib import Path
 
-from axonctl import FleetController
+from axonctl import FleetConfig, FleetController
 
 from googleadsparser import google_parser
+from googleadsparser.config import FleetOptions, ScrapeConfig, load_config
 
 logger = logging.getLogger("googleadsparser")
 
 
-async def main() -> None:
-    """Настроить логирование и запустить парсер на устройствах флота."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+def detect_devices() -> list[str]:
+    """Серийники подключённых устройств по выводу ``adb devices``.
+
+    Returns:
+        Список серийников в состоянии ``device`` (без offline/unauthorized).
+    """
+    out = subprocess.run(["adb", "devices"], capture_output=True, text=True, check=True).stdout
+    devices: list[str] = []
+    for line in out.splitlines()[1:]:  # первая строка — заголовок «List of devices…»
+        parts = line.split()
+        if parts and parts[-1] == "device":  # serial \t device (не offline/unauthorized)
+            devices.append(parts[0])
+    return devices
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Собрать парсер аргументов командной строки."""
+    parser = argparse.ArgumentParser(
+        prog="googleadsparser",
+        description="Парсер рекламы из ленты Google Discover (Android).",
     )
-    async with FleetController.from_config("fleet.toml") as fleet:
-        results = await fleet.run(google_parser, targets="demo")
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=Path("config.toml"),
+        help="путь к TOML-конфигу (по умолчанию config.toml; если нет — дефолты)",
+    )
+    parser.add_argument(
+        "-d",
+        "--device",
+        action="append",
+        dest="devices",
+        metavar="SERIAL",
+        help="серийник устройства (можно несколько); иначе — из конфига или adb",
+    )
+    parser.add_argument("--concurrency", type=int, help="лимит одновременных устройств")
+    parser.add_argument("--swipes", type=int, help="свайпов за одну обработку ленты")
+    parser.add_argument("-o", "--output-dir", type=Path, help="каталог для собранной рекламы")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="уровень логирования (DEBUG/INFO/WARNING/ERROR; по умолчанию INFO)",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="показать подключённые устройства и выйти",
+    )
+    return parser
+
+
+def resolve_devices(cli_devices: list[str] | None, fleet: FleetOptions) -> list[str]:
+    """Определить список устройств: CLI → конфиг → автоопределение через adb.
+
+    Args:
+        cli_devices: Серийники из аргументов CLI (или ``None``).
+        fleet: Опции флота из конфига (могут содержать список устройств).
+
+    Returns:
+        Итоговый список серийников (возможно пустой).
+    """
+    if cli_devices:
+        return cli_devices
+    if fleet.devices:
+        return list(fleet.devices)
+    return detect_devices()
+
+
+async def run(scrape: ScrapeConfig, concurrency: int, devices: list[str]) -> None:
+    """Запустить парсер на указанных устройствах.
+
+    Args:
+        scrape: Параметры скрейпинга.
+        concurrency: Лимит одновременных сценариев.
+        devices: Серийники устройств.
+    """
+    fleet_config = FleetConfig(
+        concurrency=concurrency,
+        devices={serial: frozenset() for serial in devices},
+    )
+    async with FleetController(fleet_config) as fleet:
+        results = await fleet.run(lambda device: google_parser(device, scrape))
 
     for serial, outcome in results.items():
         if outcome.ok:
@@ -31,5 +120,36 @@ async def main() -> None:
             logger.error("[%s] прогон упал: %s", serial, outcome.error)
 
 
+def main() -> None:
+    """Разобрать аргументы, загрузить конфиг и запустить парсер."""
+    args = build_arg_parser().parse_args()
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if args.list_devices:
+        for serial in detect_devices():
+            print(serial)
+        return
+
+    scrape, fleet = load_config(args.config)
+
+    # Флаги CLI переопределяют конфиг.
+    if args.swipes is not None:
+        scrape = replace(scrape, swipes=args.swipes)
+    if args.output_dir is not None:
+        scrape = replace(scrape, output_dir=args.output_dir)
+    if args.concurrency is not None:
+        fleet = replace(fleet, concurrency=args.concurrency)
+
+    devices = resolve_devices(args.devices, fleet)
+    if not devices:
+        raise SystemExit("нет устройств: укажи --device или подключи устройство по adb")
+
+    logger.info("устройства: %s | свайпов: %d", ", ".join(devices), scrape.swipes)
+    asyncio.run(run(scrape, fleet.concurrency, devices))
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
