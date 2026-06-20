@@ -12,6 +12,8 @@
     uv run main.py --swipes 40 --concurrency 4
     uv run main.py --config my.toml -o ads2
     uv run main.py --list-devices           # показать подключённые устройства
+    uv run main.py --dump                   # дебаг: дамп UI текущего экрана в ui.html
+    uv run main.py --dump screen.html -d 276bcca9
 """
 
 import argparse
@@ -21,10 +23,11 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 
-from axonctl import FleetConfig, FleetController
+from axonctl import Device, FleetConfig, FleetController
 
 from googleadsparser import google_parser
 from googleadsparser.config import FleetOptions, ScrapeConfig, load_config
+from googleadsparser.debug import dump
 
 logger = logging.getLogger("googleadsparser")
 
@@ -78,6 +81,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="показать подключённые устройства и выйти",
     )
+    parser.add_argument(
+        "--dump",
+        nargs="?",
+        const="ui.html",
+        metavar="PATH",
+        help="дебаг-режим: снять дамп UI текущего экрана (device.inspect) и выйти; "
+        "по умолчанию в ui.html (для нескольких устройств серийник добавляется в имя)",
+    )
     return parser
 
 
@@ -96,6 +107,28 @@ def resolve_devices(cli_devices: list[str] | None, fleet: FleetOptions) -> list[
     if fleet.devices:
         return list(fleet.devices)
     return detect_devices()
+
+
+async def dump_ui(devices: list[str], path: str) -> None:
+    """Дебаг-режим: снять дамп UI текущего экрана устройств (без запуска парсера).
+
+    Для одного устройства дамп пишется в ``path``; для нескольких к имени файла
+    добавляется серийник, чтобы файлы не перетирались.
+
+    Args:
+        devices: Серийники устройств.
+        path: Базовый путь HTML-дампа.
+    """
+    fleet_config = FleetConfig(devices={serial: frozenset() for serial in devices})
+
+    async def scenario(device: Device) -> None:
+        out = Path(path)
+        if len(devices) > 1:
+            out = out.with_name(f"{out.stem}_{device.serial}{out.suffix}")
+        await dump(device, str(out))
+
+    async with FleetController(fleet_config) as fleet:
+        await fleet.run(scenario)
 
 
 async def run(scrape: ScrapeConfig, concurrency: int, devices: list[str]) -> None:
@@ -146,6 +179,12 @@ def main() -> None:
     devices = resolve_devices(args.devices, fleet)
     if not devices:
         raise SystemExit("нет устройств: укажи --device или подключи устройство по adb")
+
+    # Дебаг-режим: снять дамп UI и выйти, парсер не запускаем.
+    if args.dump is not None:
+        logger.info("дебаг-дамп UI: %s", ", ".join(devices))
+        asyncio.run(dump_ui(devices, args.dump))
+        return
 
     logger.info("устройства: %s | свайпов: %d", ", ".join(devices), scrape.swipes)
     asyncio.run(run(scrape, fleet.concurrency, devices))
