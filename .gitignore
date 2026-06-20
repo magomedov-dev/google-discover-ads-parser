@@ -15,3 +15,6 @@ wheels/
 # Собранные артефакты рекламы
 ads/
 errors/
+
+# pytest
+.pytest_cache/
