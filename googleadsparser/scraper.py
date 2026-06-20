@@ -86,6 +86,8 @@ class GoogleParser:
         self.screen_height: int
         #: Рабочая область ленты; заполняется в :meth:`get_working_bounds`.
         self.working_bounds: Bounds
+        #: Границы строки поиска; заполняются в :meth:`get_working_bounds`.
+        self._search_bounds: Bounds
         #: Последний снятый UI-дамп; обновляется по ходу листания.
         self._root: UiTree
         #: Имя подкаталога устройства: алиас из конфига или серийник по умолчанию.
@@ -101,6 +103,8 @@ class GoogleParser:
         self._seen: set[tuple[str | None, str | None]] = self._load_seen()
         #: Счётчик зафиксированных ошибок — для уникальных имён папок логов.
         self._error_count: int = 0
+        #: Видео-ссылка скопирована в буфер и ждёт чтения в ленте (см. _grab_video_url).
+        self._video_clipboard_pending: bool = False
 
     def _load_seen(self) -> set[tuple[str | None, str | None]]:
         """Загрузить уже собранные рекламы (канал + заголовок) из ``meta.json`` на диске.
@@ -298,6 +302,9 @@ class GoogleParser:
         )
         if search.bounds is None:
             raise RuntimeError("у строки поиска нет границ после свайпа")
+
+        # Запоминаем границы строки поиска — нужны для чтения буфера (reveal-свайп).
+        self._search_bounds = search.bounds
 
         bounds = Bounds(
             feed.bounds.left,
@@ -721,6 +728,13 @@ class GoogleParser:
             finally:
                 await self._back_to_feed()
 
+            # Видео-ссылку из «Копировать ссылку» читаем из буфера уже здесь — мы
+            # гарантированно в ленте, где доступна строка поиска для вставки.
+            if self._video_clipboard_pending:
+                self._video_clipboard_pending = False
+                video_url = await self._read_clipboard()
+                logger.info("[%s] ссылка на видео (буфер): %s", self.device.serial, video_url)
+
         # Картинка вылезала выше области — снимаем её отдельно, подтянув низ к низу
         # области (делаем уже после возврата в ленту, чтобы не сбить открытие).
         if info.media_box is not None and not media_in_frame:
@@ -997,43 +1011,81 @@ class GoogleParser:
                 url = self._extract_url(field.text or "") or (field.text or "").strip() or None
                 logger.info("[%s] ссылка на видео (поделиться): %s", self.device.serial, url)
                 return url
-            url = await self._read_clipboard()
-            logger.info("[%s] ссылка на видео (буфер): %s", self.device.serial, url)
-            return url
+            # Это была «Копировать ссылку» — ссылка уже в буфере. Сам буфер читаем
+            # позже, после гарантированного возврата в ленту (см. process_ad): отсюда,
+            # из плеера, до строки поиска не добраться надёжно.
+            self._video_clipboard_pending = True
+            logger.info(
+                "[%s] видео-ссылка скопирована в буфер — прочту в ленте", self.device.serial
+            )
+            return None
         except AxonError as exc:
             logger.warning("[%s] не удалось получить ссылку на видео: %s", self.device.serial, exc)
             return None
 
     async def _read_clipboard(self) -> str | None:
-        """Прочитать буфер обмена через вставку в поле поиска.
+        """Прочитать буфер обмена через вставку в строку поиска (вызывать на ленте).
 
-        Прямого чтения буфера на устройстве нет (cmd clipboard не реализован,
-        Android блокирует фоновое чтение), поэтому возвращаемся в ленту, фокусируем
-        строку поиска, вставляем буфер (KEYCODE_PASTE) и читаем текст поля. За собой
-        очищаем поле и закрываем поиск. Best-effort.
+        Прямого чтения буфера на устройстве нет (``cmd clipboard`` не реализован,
+        Android блокирует фоновое чтение), поэтому открываем строку поиска, фокусируем
+        её EditText, чистим, вставляем буфер (``KEYCODE_PASTE``) и читаем текст поля.
+        Делаем до двух попыток вставки (паста иногда не срабатывает с первого раза).
+        За собой очищаем поле и закрываем поиск. Best-effort: при сбое ``None``.
+
+        Предполагается, что мы уже в ленте (см. вызов в :meth:`process_ad` после
+        ``_back_to_feed``); на всякий случай добиваемся ленты повторно.
         """
         if not await self._back_until(GoogleSelectors.FEED):
             return None
-        box = await self.device.find(GoogleSelectors.SEARCH)
-        if box is None or box.center is None:
+
+        # После возврата из плеера лента прокручена и строка поиска свёрнута/смещена.
+        # Свайпом вниз (лента вверх) на вертикальный размер SEARCH возвращаем её на
+        # место, иначе тап по ней не открывает поиск и вставка не срабатывает.
+        reveal = self._search_bounds.bottom - self._search_bounds.top
+        cx = self.working_bounds.center.x
+        await self.device.swipe(
+            cx, self.working_bounds.top, cx, self.working_bounds.top + reveal, duration=reveal
+        )
+        await asyncio.sleep(self.config.settle)
+
+        # Дожидаемся строки поиска (а не мгновенный find): лента ещё может рисоваться.
+        try:
+            box = await self.device.wait_for(
+                GoogleSelectors.SEARCH, timeout=self.config.ready_timeout
+            )
+        except WaitTimeout:
+            return None
+        if box.center is None:
             return None
 
+        # Открываем строку поиска и дожидаемся редактируемого поля.
         await self.device.tap(box.center.x, box.center.y)
-        await asyncio.sleep(self.config.settle)
-        if await self.device.find(GoogleSelectors.EDIT_TEXT) is None:
+        try:
+            edit = await self.device.wait_for(
+                GoogleSelectors.EDIT_TEXT, timeout=self.config.ad_load_timeout
+            )
+        except WaitTimeout:
+            await self.device.global_action("back")
             return None
 
-        await self.device.set_text(GoogleSelectors.EDIT_TEXT, "")
         adb = self.device._require_adb()
-        await adb.shell(self.device.serial, "input keyevent 279")  # KEYCODE_PASTE
-        await asyncio.sleep(self.config.settle)
-
-        field = await self.device.find(GoogleSelectors.EDIT_TEXT)
-        text = (field.text or "") if field is not None else ""
+        url: str | None = None
+        for _ in range(2):  # паста иногда не срабатывает с первого раза
+            if edit.center is not None:
+                await self.device.tap(edit.center.x, edit.center.y)  # гарантируем фокус
+            await self.device.set_text(GoogleSelectors.EDIT_TEXT, "")
+            await adb.shell(self.device.serial, "input keyevent 279")  # KEYCODE_PASTE
+            await asyncio.sleep(self.config.settle)
+            field = await self.device.find(GoogleSelectors.EDIT_TEXT)
+            raw = (field.text or "") if field is not None else ""
+            logger.debug("[%s] буфер (сырой текст поля): %r", self.device.serial, raw)
+            url = self._extract_url(raw)
+            if url is not None:
+                break
 
         await self.device.set_text(GoogleSelectors.EDIT_TEXT, "")  # убираем за собой
         await self.device.global_action("back")  # закрыть клавиатуру/поиск
-        return self._extract_url(text)
+        return url
 
     async def _back_until(self, selector: Selector, attempts: int | None = None) -> bool:
         """Жать back, пока на экране не появится ``selector`` (или не кончатся попытки)."""
