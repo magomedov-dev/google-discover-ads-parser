@@ -59,6 +59,7 @@ class ScrapeConfig:
         settle_timeout: Максимум ожидания, пока лента догрузится и остановится, с.
         settle_stable: Сколько одинаковых дампов подряд считаем «лента успокоилась».
         launch_attempts: Попыток запустить приложение, прежде чем сдаться.
+        page_info_attempts: Попыток снять полный URL лендинга через page-info.
     """
 
     swipes: int = 25
@@ -77,6 +78,7 @@ class ScrapeConfig:
     settle_timeout: float = 8.0
     settle_stable: int = 2
     launch_attempts: int = 3
+    page_info_attempts: int = 2
 
     @classmethod
     def from_section(cls, section: dict[str, Any]) -> "ScrapeConfig":

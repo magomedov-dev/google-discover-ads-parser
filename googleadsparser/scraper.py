@@ -700,7 +700,7 @@ class GoogleParser:
         # Картинка вылезала выше области — снимаем её отдельно, подтянув низ к низу
         # области (делаем уже после возврата в ленту, чтобы не сбить открытие).
         if info.media_box is not None and not media_in_frame:
-            await self._capture_media_aligned(ad_dir)
+            await self._capture_media_aligned(ad_dir, (info.channel, info.text))
 
         (ad_dir / "meta.json").write_text(
             json.dumps(
@@ -719,15 +719,19 @@ class GoogleParser:
             encoding="utf-8",
         )
 
-    async def _capture_media_aligned(self, ad_dir: Path) -> None:
+    async def _capture_media_aligned(
+        self, ad_dir: Path, expected: tuple[str | None, str | None]
+    ) -> None:
         """Снять картинку рекламы, подтянув её низ к низу рабочей области.
 
         Нужно, когда верх карточки выше рабочей области (картинка не влезает целиком).
-        Заново находим карточку в ленте, доводим низ медиа к низу области и кропим.
-        Best-effort: при сбое просто не перезаписываем media.png.
+        Заново находим карточку в ленте, проверяем, что это та же реклама (канал +
+        заголовок) — чтобы не снять чужую, если лента сместилась, — доводим низ медиа к
+        низу области и кропим. Best-effort: при сбое/несовпадении не трогаем media.png.
 
         Args:
             ad_dir: Каталог рекламы, куда сохраняется ``media.png``.
+            expected: Ожидаемая пара ``(канал, заголовок)`` обрабатываемой рекламы.
         """
         try:
             self._root = await self.wait_feed_settled()
@@ -735,6 +739,12 @@ class GoogleParser:
             if card is None:
                 return
             info = self.parse_ad(card)
+            if (info.channel, info.text) != expected:
+                logger.warning(
+                    "[%s] в ленте другая реклама — пропускаю отдельный скрин картинки",
+                    self.device.serial,
+                )
+                return
             if info.media_bottom is None:
                 return
 
@@ -744,7 +754,7 @@ class GoogleParser:
             if card is None:
                 return
             info = self.parse_ad(card)
-            if info.media_box is None:
+            if (info.channel, info.text) != expected or info.media_box is None:
                 return
 
             image = await self.take_screenshot()
@@ -804,41 +814,51 @@ class GoogleParser:
 
         Тапаем адресную строку (``url_bar``) — открывается попап page info с усечённым
         до домена адресом; тапаем по нему (``page_info_truncated_url``), чтобы раскрыть
-        полный адрес, и читаем его из ``page_info_url``. Попап закрываем в любом случае,
-        иначе он перекроет тулбар и сломает следующий шаг. Best-effort: при сбое —
+        полный адрес, и читаем его из ``page_info_url``. Попап иногда не успевает
+        отрисоваться, поэтому повторяем до :attr:`config.page_info_attempts` раз. Попап
+        закрываем в любом случае, иначе он перекроет тулбар. Best-effort: при сбое —
         ``None``.
         """
-        try:
-            # Короткий таймаут: page-info — необязательный шаг, флак не должен съедать
-            # 15с и ломать сбор основной ссылки.
-            bar = await self.device.wait_for(
-                GoogleSelectors.CHROME_URL_BAR, timeout=self.config.ad_load_timeout
-            )
-            if bar.center is not None:
-                await self.device.tap(bar.center.x, bar.center.y)
+        # Короткий таймаут: page-info — необязательный шаг, флак не должен съедать
+        # 15с и ломать сбор основной ссылки; вместо этого делаем несколько попыток.
+        for attempt in range(1, self.config.page_info_attempts + 1):
             try:
-                # Тап по усечённому домену раскрывает полный URL.
-                truncated = await self.device.wait_for(
-                    GoogleSelectors.PAGE_INFO_TRUNCATED_URL, timeout=self.config.ad_load_timeout
+                bar = await self.device.wait_for(
+                    GoogleSelectors.CHROME_URL_BAR, timeout=self.config.ad_load_timeout
                 )
-                if truncated.center is not None:
-                    await self.device.tap(truncated.center.x, truncated.center.y)
-                    await asyncio.sleep(self.config.settle)
+                if bar.center is not None:
+                    await self.device.tap(bar.center.x, bar.center.y)
+                try:
+                    # Тап по усечённому домену раскрывает полный URL.
+                    truncated = await self.device.wait_for(
+                        GoogleSelectors.PAGE_INFO_TRUNCATED_URL, timeout=self.config.ad_load_timeout
+                    )
+                    if truncated.center is not None:
+                        await self.device.tap(truncated.center.x, truncated.center.y)
+                        await asyncio.sleep(self.config.settle)
 
-                url_node = await self.device.wait_for(
-                    GoogleSelectors.PAGE_INFO_URL, timeout=self.config.ad_load_timeout
+                    url_node = await self.device.wait_for(
+                        GoogleSelectors.PAGE_INFO_URL, timeout=self.config.ad_load_timeout
+                    )
+                    url = (
+                        self._extract_url(url_node.text or "")
+                        or (url_node.text or "").strip()
+                        or None
+                    )
+                    logger.info("[%s] полный URL лендинга: %s", self.device.serial, url)
+                    return url
+                finally:
+                    # Попап перекрывает тулбар — закрываем его (back до Chrome).
+                    await self._back_until(GoogleSelectors.CHROME_TOOL_BAR)
+            except AxonError as exc:
+                logger.warning(
+                    "[%s] page-info попытка %d/%d не удалась: %s",
+                    self.device.serial,
+                    attempt,
+                    self.config.page_info_attempts,
+                    exc,
                 )
-                url = (
-                    self._extract_url(url_node.text or "") or (url_node.text or "").strip() or None
-                )
-                logger.info("[%s] полный URL лендинга: %s", self.device.serial, url)
-                return url
-            finally:
-                # Попап перекрывает тулбар — закрываем его (back до Chrome).
-                await self._back_until(GoogleSelectors.CHROME_TOOL_BAR)
-        except AxonError as exc:
-            logger.warning("[%s] не удалось получить URL лендинга: %s", self.device.serial, exc)
-            return None
+        return None
 
     async def _grab_landing_url(self) -> str | None:
         """Снять ссылку на сайт рекламы через кнопку «Share link» в тулбаре Chrome.
