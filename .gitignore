@@ -14,6 +14,7 @@ wheels/
 
 # Собранные артефакты рекламы
 ads/
+ad_dumps_*/
 nodes/
 
 # Отладочные снимки UI (device.inspect)
