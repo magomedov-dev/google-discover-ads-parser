@@ -97,9 +97,32 @@ class GoogleParser:
         #: Счётчик сохранённых реклам — продолжается с последней на диске (переживает перезапуск).
         self._ad_count: int = self._last_ad_index()
         #: Уже обработанные рекламы (канал + заголовок) — чтобы не собирать дубли.
-        self._seen: set[tuple[str | None, str | None]] = set()
+        #: Подхватываем собранные в прошлых запусках, чтобы дедуп переживал перезапуск.
+        self._seen: set[tuple[str | None, str | None]] = self._load_seen()
         #: Счётчик зафиксированных ошибок — для уникальных имён папок логов.
         self._error_count: int = 0
+
+    def _load_seen(self) -> set[tuple[str | None, str | None]]:
+        """Загрузить уже собранные рекламы (канал + заголовок) из ``meta.json`` на диске.
+
+        Позволяет дедупу переживать перезапуск скрипта: ранее сохранённые рекламы не
+        собираются повторно. Битые/отсутствующие ``meta.json`` пропускаются.
+
+        Returns:
+            Множество пар ``(канал, заголовок)`` уже собранных реклам.
+        """
+        seen: set[tuple[str | None, str | None]] = set()
+        if not self._out_dir.exists():
+            return seen
+        for meta_path in self._out_dir.glob("ad*/meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                seen.add((meta.get("channel"), meta.get("text")))
+            except (OSError, ValueError):
+                continue
+        if seen:
+            logger.info("[%s] подхвачено %d ранее собранных реклам", self.device.serial, len(seen))
+        return seen
 
     async def _capture_error(self, stage: str, exc: BaseException) -> None:
         """Зафиксировать ошибку: трейсбек и снимок UI в каталог ошибок из конфига.
