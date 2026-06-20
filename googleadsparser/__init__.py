@@ -8,8 +8,17 @@
 * :class:`~googleadsparser.selectors.GoogleSelectors` — селекторы UI.
 """
 
+from .config import FleetOptions, ScrapeConfig, load_config
 from .models import AdInfo
 from .scraper import GoogleParser, google_parser
 from .selectors import GoogleSelectors
 
-__all__ = ["AdInfo", "GoogleParser", "GoogleSelectors", "google_parser"]
+__all__ = [
+    "AdInfo",
+    "FleetOptions",
+    "GoogleParser",
+    "GoogleSelectors",
+    "ScrapeConfig",
+    "google_parser",
+    "load_config",
+]
