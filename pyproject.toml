@@ -1,6 +1,6 @@
 [project]
 name = "googleadsparser"
-version = "1.2.0"
+version = "1.2.1"
 description = "Парсер рекламы из ленты Google Discover на Android (axonctl)"
 readme = "README.md"
 license = "MIT"
