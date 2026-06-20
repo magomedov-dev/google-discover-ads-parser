@@ -18,6 +18,7 @@ axonctl = { git = "https://github.com/magomedov-dev/axonctl.git" }
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "ruff",
     "ty",
 ]
@@ -37,6 +38,10 @@ ignore = [
     "RUF001", "RUF002", "RUF003",  # неоднозначный unicode — в проекте кириллица
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# В тестах сравнения с литералами — это и есть ожидаемые значения.
+"tests/**" = ["PLR2004"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["googleadsparser"]
 
@@ -51,3 +56,7 @@ root = ["."]
 
 [tool.ty.rules]
 unresolved-import = "warn"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
