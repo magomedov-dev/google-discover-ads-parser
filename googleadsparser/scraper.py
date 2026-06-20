@@ -156,13 +156,17 @@ class GoogleParser:
     async def launch(self) -> None:
         """Запустить приложение и дождаться его готовности.
 
-        Ждём не только строку поиска, но и саму ленту: на плохом интернете
-        ``RecyclerView`` инфлейтится заметно позже поисковой строки.
+        Перед запуском всегда делаем force-stop приложения: если оно уже открыто
+        (например, осталось от предыдущего сеанса), убиваем его, чтобы стартовать с
+        чистого состояния. Ждём не только строку поиска, но и саму ленту: на плохом
+        интернете ``RecyclerView`` инфлейтится заметно позже поисковой строки.
 
         Raises:
             axonctl.WaitTimeout: Если приложение/элементы не появились за
                 :attr:`READY_TIMEOUT`.
         """
+        # Убиваем приложение, если оно уже открыто — старт с чистого состояния.
+        await self.device.kill(self.APP)
         logger.info("[%s] запускаю %s", self.device.serial, self.APP)
         await self.device.launch(self.APP)
         await self.device.wait_activity(self.APP, timeout=self.config.ready_timeout)
