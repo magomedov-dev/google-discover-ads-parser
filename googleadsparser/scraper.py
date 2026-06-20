@@ -696,7 +696,8 @@ class GoogleParser:
 
         # 3-4. Текст и канал (+ структура и HTML для отладки) — пишем в meta.json ниже.
         save_node(card, ad_dir / "structure.json")
-        await self.device.inspect(ad_dir / "ui.html")
+        if self.config.save_ui_html:
+            await self.device.inspect(ad_dir / "ui.html")
         logger.info(
             "[%s] реклама [%s] канал=%r -> %s", self.device.serial, info.form, info.channel, ad_dir
         )
