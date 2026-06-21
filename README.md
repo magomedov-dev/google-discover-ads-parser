@@ -29,12 +29,37 @@
 
 - Python ≥ 3.13, [uv](https://docs.astral.sh/uv/)
 - Android-устройство с включённой отладкой по USB и `adb` в `PATH`
+- Установленный на устройстве агент [Axon](https://github.com/magomedov-dev/axon)
+  с включённым accessibility-сервисом (см. «Агент Axon на устройстве»)
 
 ## Установка
 
 ```bash
 uv sync
 ```
+
+## Агент Axon на устройстве (обязательно)
+
+Парсер управляет устройством через [`axonctl`](https://github.com/magomedov-dev/axonctl),
+который общается с агентом **Axon** на телефоне. Без него ничего не заработает.
+
+1. Установить APK агента:
+   ```bash
+   adb install axon-0.1.0.apk
+   ```
+   APK — из релизов репозитория [magomedov-dev/axon](https://github.com/magomedov-dev/axon):
+   [axon-0.1.0.apk](https://github.com/magomedov-dev/axon/releases/download/v0.1.0/axon-0.1.0.apk).
+
+2. Включить accessibility-сервис. На AOSP это можно сделать с хоста:
+   ```bash
+   scripts/device.sh enable     # добавляет наш сервис, не затирая чужие
+   scripts/device.sh forward    # adb forward tcp:9008
+   scripts/device.sh status     # включённые сервисы + foreground-пакет
+   ```
+   …либо открыть приложение **Axon** и нажать «Открыть настройки спец. возможностей».
+
+Экран приложения Axon — живой пульт: индикаторы сервиса/сервера, счётчик
+подключений, тумблер запуска/остановки сервера и переключатель языка RU/EN.
 
 ## Подготовка устройства (обязательно)
 
