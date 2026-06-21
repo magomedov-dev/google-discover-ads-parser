@@ -17,7 +17,7 @@
 """
 
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,10 @@ class ScrapeConfig:
     Attributes:
         swipes: Сколько свайпов (итераций) делать за одну обработку ленты.
         output_dir: Корневой каталог для собранной рекламы (подкаталог на устройство).
+        device_names: Карта ``серийник -> имя подкаталога`` в ``output_dir``; для
+            устройств не из карты подкаталог называется по серийнику.
+        error_dir: Каталог для логов ошибок (на каждую ошибку — папка с дампом UI и
+            трейсбеком).
         align_tolerance: Допуск выравнивания низа рекламы (px).
         ready_timeout: Ожидание появления элементов (медленный старт/инет), с.
         ad_load_timeout: Ожидание загрузки сайта/диалогов рекламы, с.
@@ -59,6 +63,8 @@ class ScrapeConfig:
 
     swipes: int = 25
     output_dir: Path = Path("ads")
+    device_names: dict[str, str] = field(default_factory=dict)
+    error_dir: Path = Path("errors")
     align_tolerance: int = 20
     ready_timeout: float = 15.0
     ad_load_timeout: float = 3.0
@@ -85,6 +91,10 @@ class ScrapeConfig:
         kwargs = _kwargs_for(cls, section)
         if "output_dir" in kwargs:
             kwargs["output_dir"] = Path(kwargs["output_dir"])
+        if "error_dir" in kwargs:
+            kwargs["error_dir"] = Path(kwargs["error_dir"])
+        if "device_names" in kwargs:
+            kwargs["device_names"] = {str(k): str(v) for k, v in kwargs["device_names"].items()}
         return cls(**kwargs)
 
 

@@ -18,6 +18,8 @@ import json
 import logging
 import random
 import re
+import traceback
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -86,12 +88,48 @@ class GoogleParser:
         self.working_bounds: Bounds
         #: Последний снятый UI-дамп; обновляется по ходу листания.
         self._root: UiTree
+        #: Имя подкаталога устройства: алиас из конфига или серийник по умолчанию.
+        name = self.config.device_names.get(device.serial, device.serial)
         #: Каталог собранной рекламы для этого устройства.
-        self._out_dir = self.config.output_dir / device.serial
+        self._out_dir = self.config.output_dir / name
+        #: Каталог логов ошибок для этого устройства.
+        self._error_root = self.config.error_dir / name
         #: Счётчик сохранённых реклам — продолжается с последней на диске (переживает перезапуск).
         self._ad_count: int = self._last_ad_index()
         #: Уже обработанные рекламы (канал + заголовок) — чтобы не собирать дубли.
         self._seen: set[tuple[str | None, str | None]] = set()
+        #: Счётчик зафиксированных ошибок — для уникальных имён папок логов.
+        self._error_count: int = 0
+
+    async def _capture_error(self, stage: str, exc: BaseException) -> None:
+        """Зафиксировать ошибку: трейсбек и снимок UI в каталог ошибок из конфига.
+
+        На каждую ошибку создаётся уникальная папка
+        ``<error_dir>/<имя устройства>/<время>_<NNN>_<stage>`` с файлами:
+
+        * ``error.txt`` — стадия, тип/текст исключения и полный трейсбек;
+        * ``ui.html`` — интерактивный снимок текущего экрана (best-effort).
+
+        Args:
+            stage: Метка места, где произошла ошибка (``parse_feed`` / ``cycle`` / …).
+            exc: Пойманное исключение.
+        """
+        self._error_count += 1
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        err_dir = self._error_root / f"{stamp}_{self._error_count:03d}_{stage}"
+        try:
+            err_dir.mkdir(parents=True, exist_ok=True)
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            (err_dir / "error.txt").write_text(
+                f"stage: {stage}\n{type(exc).__name__}: {exc}\n\n{tb}", encoding="utf-8"
+            )
+            try:
+                await self.device.inspect(err_dir / "ui.html")
+            except Exception as snap_exc:  # снять UI не всегда возможно (обрыв связи)
+                (err_dir / "inspect_failed.txt").write_text(repr(snap_exc), encoding="utf-8")
+            logger.error("[%s] ошибка [%s] зафиксирована в %s", self.device.serial, stage, err_dir)
+        except Exception as log_exc:  # логирование ошибки не должно ронять прогон
+            logger.error("[%s] не удалось зафиксировать ошибку: %s", self.device.serial, log_exc)
 
     def _last_ad_index(self) -> int:
         """Найти наибольший уже сохранённый номер рекламы, чтобы продолжить нумерацию.
@@ -651,6 +689,7 @@ class GoogleParser:
                     video_url = await self._grab_video_url()
             except AxonError as exc:
                 logger.warning("[%s] сбой при сборе ссылок: %s", self.device.serial, exc)
+                await self._capture_error("links", exc)
             finally:
                 await self._back_to_feed()
 
@@ -1121,6 +1160,7 @@ class GoogleParser:
                     swipes,
                     exc,
                 )
+                await self._capture_error("parse_feed", exc)
                 await asyncio.sleep(self.config.settle)
         logger.info("[%s] листание завершено", self.device.serial)
 
@@ -1170,6 +1210,7 @@ class GoogleParser:
                     await self.update_feed()  # освежить ленту перед перезапуском
                 except (AxonError, RuntimeError) as exc:
                     logger.error("[%s] цикл %d прерван: %s", self.device.serial, cycle, exc)
+                    await self._capture_error("cycle", exc)
                 finally:
                     # Полностью закрываем приложение — следующий цикл откроет его заново.
                     await self.kill()
